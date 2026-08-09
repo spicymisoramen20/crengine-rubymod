@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <set>
 #include "../include/crsetup.h"
 #include "../include/cssdef.h"
 #include "../include/lvfnt.h"
@@ -49,6 +50,70 @@ static bool verticalTextDebugEnabled()
 {
     return getenv("KO_DEBUG_VERT_BG") != NULL;
 }
+
+// -----------------------------------------------------------------------------
+// Furigana Tool: transient ruby paint visibility.
+//
+// This state affects DRAWING ONLY. It does not modify DOM style, formatting,
+// ruby metrics, JFM spacing, line breaking, or vertical positioning.
+// -----------------------------------------------------------------------------
+static bool g_ruby_toggle_mode = false;
+static std::set<const ldomNode *> g_ruby_toggle_revealed;
+
+static ldomNode * rubyToggleFindAncestor(ldomNode * node, const char * name)
+{
+    if (!node)
+        return NULL;
+    if (node->isEffectiveText())
+        node = node->getParentNode();
+
+    while (node) {
+        if (node->isElement() && node->getNodeName() == name)
+            return node;
+        node = node->getParentNode();
+    }
+    return NULL;
+}
+
+void rubyToggleSetMode(bool enabled)
+{
+    g_ruby_toggle_mode = enabled;
+    if (!enabled)
+        g_ruby_toggle_revealed.clear();
+}
+
+void rubyToggleClear()
+{
+    g_ruby_toggle_revealed.clear();
+}
+
+void rubyToggleSetVisible(ldomNode * ruby, bool visible)
+{
+    if (!ruby)
+        return;
+
+    if (visible)
+        g_ruby_toggle_revealed.insert(ruby);
+    else
+        g_ruby_toggle_revealed.erase(ruby);
+}
+
+static bool rubyToggleShouldSuppress(ldomNode * node)
+{
+    if (!g_ruby_toggle_mode || !node)
+        return false;
+
+    ldomNode * rt = rubyToggleFindAncestor(node, "rt");
+    if (!rt)
+        return false;
+
+    ldomNode * ruby = rubyToggleFindAncestor(rt->getParentNode(), "ruby");
+    if (!ruby)
+        return false;
+
+    return g_ruby_toggle_revealed.find(ruby) == g_ruby_toggle_revealed.end();
+}
+
 
 static bool isVerticalTextLineDebugClass(const lString32 &cls)
 {
@@ -6693,6 +6758,13 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
             {
                 word = &frmline->words[j];
                 srcline = &m_pbuffer->srctext[word->src_text_index];
+
+                // Furigana Tool: suppress only the paint of <rt> descendants.
+                // The formatted word remains present with its original geometry.
+                ldomNode * ruby_toggle_node = (ldomNode *)srcline->object;
+                if (rubyToggleShouldSuppress(ruby_toggle_node))
+                    continue;
+
                 if ( (srcline->flags & LTEXT_HAS_EXTRA) && getLTextExtraProperty(srcline, LTEXT_EXTRA_CSS_HIDDEN) && !buf->WantsHiddenContent() )
                     continue;
                 if ( srcline->flags & LTEXT_HAS_TOP_BOTTOM_BORDER ) {
