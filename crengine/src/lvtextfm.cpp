@@ -98,16 +98,42 @@ void rubyToggleSetVisible(ldomNode * ruby, bool visible)
         g_ruby_toggle_revealed.erase(ruby);
 }
 
+static bool rubyToggleIsAnnotationSide(ldomNode * node)
+{
+    if (!node)
+        return false;
+    if (node->isEffectiveText())
+        node = node->getParentNode();
+
+    while (node) {
+        if (node->isElement()) {
+            lUInt16 id = node->getNodeId();
+            if (isRubyAnnotId(id))
+                return true;
+            // Vertical boxing may expose annotation cells as synthetic rubyBox
+            // nodes marked T="rt"/"rtc" rather than an element named <rt>.
+            if (id == el_rubyBox && node->hasAttribute(attr_T)) {
+                lString32 t = node->getAttributeValue(attr_T);
+                if (t == U"rt" || t == U"rtc")
+                    return true;
+            }
+            if (node->getNodeName() == "rt" || node->getNodeName() == "rtc")
+                return true;
+        }
+        node = node->getParentNode();
+    }
+    return false;
+}
+
 static bool rubyToggleShouldSuppress(ldomNode * node)
 {
     if (!g_ruby_toggle_mode || !node)
         return false;
 
-    ldomNode * rt = rubyToggleFindAncestor(node, "rt");
-    if (!rt)
+    if (!rubyToggleIsAnnotationSide(node))
         return false;
 
-    ldomNode * ruby = rubyToggleFindAncestor(rt->getParentNode(), "ruby");
+    ldomNode * ruby = rubyToggleFindAncestor(node, "ruby");
     if (!ruby)
         return false;
 
@@ -7071,6 +7097,10 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
             {
                 word = &frmline->words[j];
                 srcline = &m_pbuffer->srctext[word->src_text_index];
+                // Furigana Tool: the bgcolor pass above already skips suppressed
+                // <rt> words; this is the actual glyph/inline-box draw pass.
+                if (rubyToggleShouldSuppress((ldomNode *)srcline->object))
+                    continue;
                 if ( (srcline->flags & LTEXT_HAS_EXTRA) && getLTextExtraProperty(srcline, LTEXT_EXTRA_CSS_HIDDEN) && !buf->WantsHiddenContent() )
                     continue;
                 if (word->flags & LTEXT_WORD_IS_IMAGE)
