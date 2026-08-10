@@ -57,7 +57,15 @@ static bool verticalTextDebugEnabled()
 // This state affects DRAWING ONLY. It does not modify DOM style, formatting,
 // ruby metrics, JFM spacing, line breaking, or vertical positioning.
 // -----------------------------------------------------------------------------
+enum RubyToggleObscureStyle {
+    RUBY_TOGGLE_OBSCURE_HIDDEN = 0,
+    RUBY_TOGGLE_OBSCURE_MOSAIC = 1,
+    RUBY_TOGGLE_OBSCURE_BAR = 2,
+    RUBY_TOGGLE_OBSCURE_DOTS = 3,
+};
+
 static bool g_ruby_toggle_mode = false;
+static int g_ruby_toggle_obscure = RUBY_TOGGLE_OBSCURE_HIDDEN;
 static std::set<const ldomNode *> g_ruby_toggle_revealed;
 
 static ldomNode * rubyToggleFindAncestor(ldomNode * node, const char * name)
@@ -82,6 +90,13 @@ void rubyToggleSetMode(bool enabled)
         g_ruby_toggle_revealed.clear();
 }
 
+void rubyToggleSetObscureStyle(int style)
+{
+    if (style < RUBY_TOGGLE_OBSCURE_HIDDEN || style > RUBY_TOGGLE_OBSCURE_DOTS)
+        style = RUBY_TOGGLE_OBSCURE_HIDDEN;
+    g_ruby_toggle_obscure = style;
+}
+
 void rubyToggleClear()
 {
     g_ruby_toggle_revealed.clear();
@@ -96,6 +111,68 @@ void rubyToggleSetVisible(ldomNode * ruby, bool visible)
         g_ruby_toggle_revealed.insert(ruby);
     else
         g_ruby_toggle_revealed.erase(ruby);
+}
+
+// Paint an unreadable stand-in for a suppressed <rt> word box.
+static void rubyToggleDrawObscure(LVDrawBuf * buf, int x0, int y0, int x1, int y1)
+{
+    if (!buf || x1 <= x0 || y1 <= y0)
+        return;
+
+    const lUInt32 dark = 0x888888;
+    const lUInt32 light = 0xCCCCCC;
+
+    if (g_ruby_toggle_obscure == RUBY_TOGGLE_OBSCURE_BAR) {
+        buf->FillRect(x0, y0, x1, y1, dark);
+        return;
+    }
+
+    if (g_ruby_toggle_obscure == RUBY_TOGGLE_OBSCURE_MOSAIC) {
+        int short_side = x1 - x0;
+        if (y1 - y0 < short_side)
+            short_side = y1 - y0;
+        int cell = short_side / 3;
+        if (cell < 2)
+            cell = 2;
+        if (cell > 8)
+            cell = 8;
+        for (int yy = y0; yy < y1; yy += cell) {
+            for (int xx = x0; xx < x1; xx += cell) {
+                bool on = (((xx - x0) / cell) + ((yy - y0) / cell)) & 1;
+                int xr = xx + cell;
+                int yb = yy + cell;
+                if (xr > x1)
+                    xr = x1;
+                if (yb > y1)
+                    yb = y1;
+                buf->FillRect(xx, yy, xr, yb, on ? dark : light);
+            }
+        }
+        return;
+    }
+
+    if (g_ruby_toggle_obscure == RUBY_TOGGLE_OBSCURE_DOTS) {
+        int w = x1 - x0;
+        int h = y1 - y0;
+        int r = (w < h ? w : h) / 5;
+        if (r < 1)
+            r = 1;
+        // Three dots along the longer axis of the ruby slot.
+        if (h >= w) {
+            int cx = (x0 + x1) / 2;
+            for (int i = 0; i < 3; i++) {
+                int cy = y0 + (h * (2 * i + 1)) / 6;
+                buf->FillRect(cx - r, cy - r, cx + r, cy + r, dark);
+            }
+        } else {
+            int cy = (y0 + y1) / 2;
+            for (int i = 0; i < 3; i++) {
+                int cx = x0 + (w * (2 * i + 1)) / 6;
+                buf->FillRect(cx - r, cy - r, cx + r, cy + r, dark);
+            }
+        }
+        return;
+    }
 }
 
 static bool rubyToggleIsAnnotationSide(ldomNode * node)
@@ -7097,14 +7174,17 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
             {
                 word = &frmline->words[j];
                 srcline = &m_pbuffer->srctext[word->src_text_index];
-                // Furigana Tool: the bgcolor pass above already skips suppressed
-                // <rt> words; this is the actual glyph/inline-box draw pass.
-                if (rubyToggleShouldSuppress((ldomNode *)srcline->object))
-                    continue;
+                // Furigana Tool: hide/obscure suppressed <rt> paint. Text words
+                // fall through so vertical draw-state still advances.
+                const bool ruby_suppress = rubyToggleShouldSuppress((ldomNode *)srcline->object);
+                const bool ruby_obscure = ruby_suppress
+                        && g_ruby_toggle_obscure != RUBY_TOGGLE_OBSCURE_HIDDEN;
                 if ( (srcline->flags & LTEXT_HAS_EXTRA) && getLTextExtraProperty(srcline, LTEXT_EXTRA_CSS_HIDDEN) && !buf->WantsHiddenContent() )
                     continue;
                 if (word->flags & LTEXT_WORD_IS_IMAGE)
                 {
+                    if (ruby_suppress && !ruby_obscure)
+                        continue;
                     ldomNode * node = (ldomNode *) srcline->object;
                     if (node) {
                         LVImageSourceRef img = node->getObjectImageSource();
@@ -7116,7 +7196,10 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                             int column_clip_right = draw_extra_info && draw_extra_info->vert_column_clip_right
                                     ? draw_extra_info->vert_column_clip_right : clip.right;
                             applyVerticalImageDraw(frmline, word, y, line_x, column_clip_right, vstate, x0, y0);
-                            if ( verticalTextDebugEnabled() ) {
+                            if (ruby_obscure) {
+                                rubyToggleDrawObscure(buf, x0, y0, x0 + (int)word->width, y0 + (int)word->o.height);
+                            } else {
+                                if ( verticalTextDebugEnabled() ) {
                                 lString32 img_class = node->getAttributeValue(attr_class);
                                 lString32 parent_class;
                                 ldomNode * parent = node->getParentNode();
@@ -7136,18 +7219,24 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                                         x0, y0, x0 + (int)word->width, y0 + (int)word->o.height,
                                         clip.left, clip.top, clip.right, clip.bottom,
                                         vstate.vert_min_next_x);
+                                }
+                                buf->Draw( img, x0, y0, word->width, word->o.height );
                             }
-                            buf->Draw( img, x0, y0, word->width, word->o.height );
                         } else {
                             int xx = x + frmline->x + word->x;
                             int yy = line_y + frmline->baseline - word->o.height + word->y;
-                            buf->Draw( img, xx, yy, word->width, word->o.height );
+                            if (ruby_obscure)
+                                rubyToggleDrawObscure(buf, xx, yy, xx + (int)word->width, yy + (int)word->o.height);
+                            else
+                                buf->Draw( img, xx, yy, word->width, word->o.height );
                         }
                         //buf->FillRect( xx, yy, xx+word->width, yy+word->height, 1 );
                     }
                 }
                 else if (word->flags & LTEXT_WORD_IS_INLINE_BOX)
                 {
+                    if (ruby_suppress && !ruby_obscure)
+                        continue;
                     ldomNode * node = (ldomNode *) srcline->object;
                     // Logically, the coordinates of the top left of the box are:
                     // int x0 = x + frmline->x + word->x;
@@ -7188,7 +7277,20 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                         getAbsMarksFromMarks(marks, absmarks, node);
                         absmarks_update_needed = false;
                     }
-                    if ( srcline->o.objflags & LTEXT_OBJECT_IS_EMBEDDED_BLOCK ) {
+                    if (ruby_obscure) {
+                        int bw = (int)word->width;
+                        int bh = (int)word->o.height;
+                        if (bw <= 0)
+                            bw = bh > 0 ? bh : 8;
+                        if (bh <= 0)
+                            bh = bw;
+                        // Vertical-rl: word->width advances down the column (screen Y).
+                        if (is_vertical)
+                            rubyToggleDrawObscure(buf, x0, y0, x0 + bh, y0 + bw);
+                        else
+                            rubyToggleDrawObscure(buf, x0, y0, x0 + bw, y0 + bh);
+                    }
+                    else if ( srcline->o.objflags & LTEXT_OBJECT_IS_EMBEDDED_BLOCK ) {
                         // With embedded blocks, we shouldn't drop the clip (as we do next
                         // for regular inline-block boxes)
                         DrawDocument( *buf, node, x0, y0, dx, dy, doc_x_ib, doc_y_ib, page_height, absmarks, bookmarks );
@@ -7338,6 +7440,25 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                         }
                     }
                     {
+                        // Furigana Tool: after vertical draw-state is updated, either
+                        // paint an obscure stand-in or skip ink for suppressed <rt>.
+                        if (ruby_suppress) {
+                            if (ruby_obscure && !vert_skip_draw && font) {
+                                int box_w;
+                                int box_h;
+                                if (is_vertical) {
+                                    box_w = font->getSize();
+                                    box_h = (int)word->width > 0 ? (int)word->width : font->getSize();
+                                } else {
+                                    box_w = (int)word->width > 0 ? (int)word->width : font->getSize();
+                                    box_h = font->getHeight();
+                                }
+                                rubyToggleDrawObscure(buf, x0, y0, x0 + box_w, y0 + box_h);
+                            }
+                            if (word_is_latin_in_vertical) {
+                                applyVerticalLatinPostDraw((int)word->width, (int)word->width, vstate, clip, y);
+                            }
+                        } else {
                         int _adv = !vert_skip_draw ? font->DrawTextString(
                             buf,
                             x0,
@@ -7357,9 +7478,10 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                         if (word_is_latin_in_vertical) {
                             applyVerticalLatinPostDraw(_adv, (int)word->width, vstate, clip, y);
                         }
+                        }
                     }
                     // Fork: extracted vertical-mode emphasis marks (kenten/bouten).
-                    if ( is_vertical && !vert_skip_draw ) {
+                    if ( is_vertical && !vert_skip_draw && !ruby_suppress ) {
                         drawVerticalEmphasisMarks(buf, frmline, srcline, word, font,
                             y, line_x, clip, vstate);
                     }
