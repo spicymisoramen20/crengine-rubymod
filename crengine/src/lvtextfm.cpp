@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <set>
+#include <vector>
 #include "../include/crsetup.h"
 #include "../include/cssdef.h"
 #include "../include/lvfnt.h"
@@ -60,10 +61,13 @@ static bool verticalTextDebugEnabled()
 enum RubyToggleObscureStyle {
     RUBY_TOGGLE_OBSCURE_HIDDEN = 0,
     RUBY_TOGGLE_OBSCURE_BAR = 1,
+    RUBY_TOGGLE_OBSCURE_BLUR = 2,
 };
 
 static bool g_ruby_toggle_mode = false;
 static int g_ruby_toggle_obscure = RUBY_TOGGLE_OBSCURE_HIDDEN;
+static int g_ruby_toggle_blur_radius = 2;
+static int g_ruby_toggle_blur_passes = 2;
 static std::set<const ldomNode *> g_ruby_toggle_revealed;
 
 static ldomNode * rubyToggleFindAncestor(ldomNode * node, const char * name)
@@ -90,9 +94,24 @@ void rubyToggleSetMode(bool enabled)
 
 void rubyToggleSetObscureStyle(int style)
 {
-    if (style < RUBY_TOGGLE_OBSCURE_HIDDEN || style > RUBY_TOGGLE_OBSCURE_BAR)
+    if (style < RUBY_TOGGLE_OBSCURE_HIDDEN || style > RUBY_TOGGLE_OBSCURE_BLUR)
         style = RUBY_TOGGLE_OBSCURE_HIDDEN;
     g_ruby_toggle_obscure = style;
+}
+
+void rubyToggleSetBlurParams(int radius, int passes)
+{
+    // Hard safety clamps (UI can offer wide ranges within these).
+    if (radius < 0)
+        radius = 0;
+    if (radius > 64)
+        radius = 64;
+    if (passes < 1)
+        passes = 1;
+    if (passes > 20)
+        passes = 20;
+    g_ruby_toggle_blur_radius = radius;
+    g_ruby_toggle_blur_passes = passes;
 }
 
 void rubyToggleClear()
@@ -111,15 +130,108 @@ void rubyToggleSetVisible(ldomNode * ruby, bool visible)
         g_ruby_toggle_revealed.erase(ruby);
 }
 
-// Paint an unreadable stand-in for a suppressed <rt> word box.
-static void rubyToggleDrawObscure(LVDrawBuf * buf, int x0, int y0, int x1, int y1)
+// Solid gray stand-in for Bar hide style.
+static void rubyToggleDrawBar(LVDrawBuf * buf, int x0, int y0, int x1, int y1)
 {
     if (!buf || x1 <= x0 || y1 <= y0)
         return;
+    buf->FillRect(x0, y0, x1, y1, 0x888888);
+}
 
-    if (g_ruby_toggle_obscure == RUBY_TOGGLE_OBSCURE_BAR) {
-        buf->FillRect(x0, y0, x1, y1, 0x888888);
+// Separable box blur over a rectangle (edge-clamped). Expands by radius so
+// glyphs soften into the surrounding page instead of leaving a hard edge.
+static void rubyToggleBoxBlurRect(LVDrawBuf * buf, int x0, int y0, int x1, int y1)
+{
+    if (!buf)
         return;
+    int radius = g_ruby_toggle_blur_radius;
+    int passes = g_ruby_toggle_blur_passes;
+    if (radius < 1 || passes < 1 || x1 <= x0 || y1 <= y0)
+        return;
+
+    const int bw = buf->GetWidth();
+    const int bh = buf->GetHeight();
+    x0 -= radius;
+    y0 -= radius;
+    x1 += radius;
+    y1 += radius;
+    if (x0 < 0)
+        x0 = 0;
+    if (y0 < 0)
+        y0 = 0;
+    if (x1 > bw)
+        x1 = bw;
+    if (y1 > bh)
+        y1 = bh;
+    const int w = x1 - x0;
+    const int h = y1 - y0;
+    if (w < 1 || h < 1)
+        return;
+
+    // Guard against pathological sizes (should only be ruby slots).
+    if (w > 512 || h > 512)
+        return;
+
+    std::vector<lUInt32> src((size_t)w * (size_t)h);
+    std::vector<lUInt32> dst((size_t)w * (size_t)h);
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++)
+            src[(size_t)y * (size_t)w + (size_t)x] = buf->GetPixel(x0 + x, y0 + y);
+    }
+
+    const int diam = radius * 2 + 1;
+    for (int pass = 0; pass < passes; pass++) {
+        // Horizontal
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int rsum = 0, gsum = 0, bsum = 0;
+                for (int k = -radius; k <= radius; k++) {
+                    int xx = x + k;
+                    if (xx < 0)
+                        xx = 0;
+                    else if (xx >= w)
+                        xx = w - 1;
+                    lUInt32 p = src[(size_t)y * (size_t)w + (size_t)xx];
+                    rsum += (int)((p >> 16) & 0xFF);
+                    gsum += (int)((p >> 8) & 0xFF);
+                    bsum += (int)(p & 0xFF);
+                }
+                dst[(size_t)y * (size_t)w + (size_t)x] =
+                    ((lUInt32)(rsum / diam) << 16)
+                    | ((lUInt32)(gsum / diam) << 8)
+                    | (lUInt32)(bsum / diam);
+            }
+        }
+        src.swap(dst);
+        // Vertical
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int rsum = 0, gsum = 0, bsum = 0;
+                for (int k = -radius; k <= radius; k++) {
+                    int yy = y + k;
+                    if (yy < 0)
+                        yy = 0;
+                    else if (yy >= h)
+                        yy = h - 1;
+                    lUInt32 p = src[(size_t)yy * (size_t)w + (size_t)x];
+                    rsum += (int)((p >> 16) & 0xFF);
+                    gsum += (int)((p >> 8) & 0xFF);
+                    bsum += (int)(p & 0xFF);
+                }
+                dst[(size_t)y * (size_t)w + (size_t)x] =
+                    ((lUInt32)(rsum / diam) << 16)
+                    | ((lUInt32)(gsum / diam) << 8)
+                    | (lUInt32)(bsum / diam);
+            }
+        }
+        src.swap(dst);
+    }
+
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            lUInt32 c = src[(size_t)y * (size_t)w + (size_t)x];
+            buf->FillRect(x0 + x, y0 + y, x0 + x + 1, y0 + y + 1, c);
+        }
     }
 }
 
@@ -7124,14 +7236,20 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                 srcline = &m_pbuffer->srctext[word->src_text_index];
                 // Furigana Tool: hide/obscure suppressed <rt> paint. Text words
                 // fall through so vertical draw-state still advances.
+                // - Hidden: skip ink
+                // - Bar: skip ink, paint solid gray
+                // - Blur: paint glyphs then box-blur the slot
                 const bool ruby_suppress = rubyToggleShouldSuppress((ldomNode *)srcline->object);
-                const bool ruby_obscure = ruby_suppress
-                        && g_ruby_toggle_obscure != RUBY_TOGGLE_OBSCURE_HIDDEN;
+                const bool ruby_bar = ruby_suppress
+                        && g_ruby_toggle_obscure == RUBY_TOGGLE_OBSCURE_BAR;
+                const bool ruby_blur = ruby_suppress
+                        && g_ruby_toggle_obscure == RUBY_TOGGLE_OBSCURE_BLUR;
+                const bool ruby_hide_ink = ruby_suppress && !ruby_blur;
                 if ( (srcline->flags & LTEXT_HAS_EXTRA) && getLTextExtraProperty(srcline, LTEXT_EXTRA_CSS_HIDDEN) && !buf->WantsHiddenContent() )
                     continue;
                 if (word->flags & LTEXT_WORD_IS_IMAGE)
                 {
-                    if (ruby_suppress && !ruby_obscure)
+                    if (ruby_hide_ink && !ruby_bar)
                         continue;
                     ldomNode * node = (ldomNode *) srcline->object;
                     if (node) {
@@ -7144,8 +7262,8 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                             int column_clip_right = draw_extra_info && draw_extra_info->vert_column_clip_right
                                     ? draw_extra_info->vert_column_clip_right : clip.right;
                             applyVerticalImageDraw(frmline, word, y, line_x, column_clip_right, vstate, x0, y0);
-                            if (ruby_obscure) {
-                                rubyToggleDrawObscure(buf, x0, y0, x0 + (int)word->width, y0 + (int)word->o.height);
+                            if (ruby_bar) {
+                                rubyToggleDrawBar(buf, x0, y0, x0 + (int)word->width, y0 + (int)word->o.height);
                             } else {
                                 if ( verticalTextDebugEnabled() ) {
                                 lString32 img_class = node->getAttributeValue(attr_class);
@@ -7169,21 +7287,26 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                                         vstate.vert_min_next_x);
                                 }
                                 buf->Draw( img, x0, y0, word->width, word->o.height );
+                                if (ruby_blur)
+                                    rubyToggleBoxBlurRect(buf, x0, y0, x0 + (int)word->width, y0 + (int)word->o.height);
                             }
                         } else {
                             int xx = x + frmline->x + word->x;
                             int yy = line_y + frmline->baseline - word->o.height + word->y;
-                            if (ruby_obscure)
-                                rubyToggleDrawObscure(buf, xx, yy, xx + (int)word->width, yy + (int)word->o.height);
-                            else
+                            if (ruby_bar)
+                                rubyToggleDrawBar(buf, xx, yy, xx + (int)word->width, yy + (int)word->o.height);
+                            else {
                                 buf->Draw( img, xx, yy, word->width, word->o.height );
+                                if (ruby_blur)
+                                    rubyToggleBoxBlurRect(buf, xx, yy, xx + (int)word->width, yy + (int)word->o.height);
+                            }
                         }
                         //buf->FillRect( xx, yy, xx+word->width, yy+word->height, 1 );
                     }
                 }
                 else if (word->flags & LTEXT_WORD_IS_INLINE_BOX)
                 {
-                    if (ruby_suppress && !ruby_obscure)
+                    if (ruby_hide_ink && !ruby_bar)
                         continue;
                     ldomNode * node = (ldomNode *) srcline->object;
                     // Logically, the coordinates of the top left of the box are:
@@ -7225,7 +7348,7 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                         getAbsMarksFromMarks(marks, absmarks, node);
                         absmarks_update_needed = false;
                     }
-                    if (ruby_obscure) {
+                    if (ruby_bar) {
                         int bw = (int)word->width;
                         int bh = (int)word->o.height;
                         if (bw <= 0)
@@ -7234,14 +7357,26 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                             bh = bw;
                         // Vertical-rl: word->width advances down the column (screen Y).
                         if (is_vertical)
-                            rubyToggleDrawObscure(buf, x0, y0, x0 + bh, y0 + bw);
+                            rubyToggleDrawBar(buf, x0, y0, x0 + bh, y0 + bw);
                         else
-                            rubyToggleDrawObscure(buf, x0, y0, x0 + bw, y0 + bh);
+                            rubyToggleDrawBar(buf, x0, y0, x0 + bw, y0 + bh);
                     }
                     else if ( srcline->o.objflags & LTEXT_OBJECT_IS_EMBEDDED_BLOCK ) {
                         // With embedded blocks, we shouldn't drop the clip (as we do next
                         // for regular inline-block boxes)
                         DrawDocument( *buf, node, x0, y0, dx, dy, doc_x_ib, doc_y_ib, page_height, absmarks, bookmarks );
+                        if (ruby_blur) {
+                            int bw = (int)word->width;
+                            int bh = (int)word->o.height;
+                            if (bw <= 0)
+                                bw = bh > 0 ? bh : 8;
+                            if (bh <= 0)
+                                bh = bw;
+                            if (is_vertical)
+                                rubyToggleBoxBlurRect(buf, x0, y0, x0 + bh, y0 + bw);
+                            else
+                                rubyToggleBoxBlurRect(buf, x0, y0, x0 + bw, y0 + bh);
+                        }
                     }
                     else {
                         // inline-block boxes with negative margins can overflow the
@@ -7259,6 +7394,18 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                         }
                         DrawDocument( *buf, node, x0, y0, dx, dy, doc_x_ib, doc_y_ib, page_height, absmarks, bookmarks );
                         buf->SetClipRect(&curclip); // restore original page clip
+                        if (ruby_blur) {
+                            int bw = (int)word->width;
+                            int bh = (int)word->o.height;
+                            if (bw <= 0)
+                                bw = bh > 0 ? bh : 8;
+                            if (bh <= 0)
+                                bh = bw;
+                            if (is_vertical)
+                                rubyToggleBoxBlurRect(buf, x0, y0, x0 + bh, y0 + bw);
+                            else
+                                rubyToggleBoxBlurRect(buf, x0, y0, x0 + bw, y0 + bh);
+                        }
                     }
                 }
                 else if (word->flags & LTEXT_WORD_IS_PAD)
@@ -7389,43 +7536,47 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                     }
                     {
                         // Furigana Tool: after vertical draw-state is updated, either
-                        // paint an obscure stand-in or skip ink for suppressed <rt>.
-                        if (ruby_suppress) {
-                            if (ruby_obscure && !vert_skip_draw && font) {
-                                int box_w;
-                                int box_h;
-                                if (is_vertical) {
-                                    box_w = font->getSize();
-                                    box_h = (int)word->width > 0 ? (int)word->width : font->getSize();
-                                } else {
-                                    box_w = (int)word->width > 0 ? (int)word->width : font->getSize();
-                                    box_h = font->getHeight();
-                                }
-                                rubyToggleDrawObscure(buf, x0, y0, x0 + box_w, y0 + box_h);
+                        // paint a bar, draw+blur, or skip ink for suppressed <rt>.
+                        int box_w = 0;
+                        int box_h = 0;
+                        if ((ruby_bar || ruby_blur) && font) {
+                            if (is_vertical) {
+                                box_w = font->getSize();
+                                box_h = (int)word->width > 0 ? (int)word->width : font->getSize();
+                            } else {
+                                box_w = (int)word->width > 0 ? (int)word->width : font->getSize();
+                                box_h = font->getHeight();
                             }
+                        }
+
+                        if (ruby_hide_ink) {
+                            if (ruby_bar && !vert_skip_draw && font)
+                                rubyToggleDrawBar(buf, x0, y0, x0 + box_w, y0 + box_h);
                             if (word_is_latin_in_vertical) {
                                 applyVerticalLatinPostDraw((int)word->width, (int)word->width, vstate, clip, y);
                             }
                         } else {
-                        int _adv = !vert_skip_draw ? font->DrawTextString(
-                            buf,
-                            x0,
-                            y0,
-                            str,
-                            word->t.len,
-                            '?',
-                            NULL,
-                            flgHyphen,
-                            srcline->lang_cfg,
-                            drawFlags,
-                            srcline->letter_spacing + word->added_letter_spacing,
-                            word->width,
-                            text_decoration_back_gap,
-                            w, h) : 0;
-                        // Fork: extracted post-draw state update for Latin-in-vertical.
-                        if (word_is_latin_in_vertical) {
-                            applyVerticalLatinPostDraw(_adv, (int)word->width, vstate, clip, y);
-                        }
+                            int _adv = !vert_skip_draw ? font->DrawTextString(
+                                buf,
+                                x0,
+                                y0,
+                                str,
+                                word->t.len,
+                                '?',
+                                NULL,
+                                flgHyphen,
+                                srcline->lang_cfg,
+                                drawFlags,
+                                srcline->letter_spacing + word->added_letter_spacing,
+                                word->width,
+                                text_decoration_back_gap,
+                                w, h) : 0;
+                            // Fork: extracted post-draw state update for Latin-in-vertical.
+                            if (word_is_latin_in_vertical) {
+                                applyVerticalLatinPostDraw(_adv, (int)word->width, vstate, clip, y);
+                            }
+                            if (ruby_blur && !vert_skip_draw && font)
+                                rubyToggleBoxBlurRect(buf, x0, y0, x0 + box_w, y0 + box_h);
                         }
                     }
                     // Fork: extracted vertical-mode emphasis marks (kenten/bouten).
