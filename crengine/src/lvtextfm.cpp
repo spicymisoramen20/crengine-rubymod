@@ -7662,6 +7662,35 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                             }
                             */
                         }
+                        // Fork: TCY (tate-chu-yoko) scale-to-fit in vertical-rl.
+                        // Layout reserves exactly 1em of column depth for each TCY span,
+                        // but the span is drawn horizontally. A pair like
+                        // <span class="tcy">！！</span> is ~2em wide and would otherwise
+                        // spill into neighbouring columns (other sentences). When the
+                        // natural width exceeds 1em, stretch the run into an em×em box
+                        // (shrink only — never upscale narrower TCY like "12").
+                        if ( is_vertical && (word->flags & LTEXT_WORD_IS_TCY)
+                                && !vert_skip_draw && font && str && word->t.len > 0 ) {
+                            int em = font->getSize();
+                            if ( em > 0 ) {
+                                int nat_w = (int)font->getTextWidth(str, word->t.len,
+                                        srcline->lang_cfg);
+                                if ( nat_w > em ) {
+                                    // applyVerticalWordDraw set y0 for baseline Draw;
+                                    // TRANSFORM_STRETCH uses y as the box top. Recover
+                                    // the 1em slot top from that TCY y0 formula.
+                                    int y_slot_start = y0 - (em - font->getHeight()) / 2;
+                                    drawFlags |= LFNT_HINT_TRANSFORM_STRETCH;
+                                    drawFlags &= ~(LFNT_HINT_CJK_SCALED_WIDTH
+                                            | LFNT_HINT_CJK_ALTERED_WIDTH);
+                                    w = em;
+                                    h = em;
+                                    x0 = line_x - (int)frmline->height
+                                            + ((int)frmline->height - em) / 2;
+                                    y0 = y_slot_start;
+                                }
+                            }
+                        }
                     }
                     {
                         // Furigana Tool: after vertical draw-state is updated, either
