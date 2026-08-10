@@ -69,6 +69,8 @@ enum RubyToggleObscureStyle {
     RUBY_TOGGLE_OBSCURE_CHECKER = 7,
     RUBY_TOGGLE_OBSCURE_HATCH = 8,
     RUBY_TOGGLE_OBSCURE_NOISE = 9,
+    // Skip <rt> ink; fill the slot with a fine light Bayer fog (e-ink-friendly).
+    RUBY_TOGGLE_OBSCURE_FOG = 10,
 };
 
 // How to re-encode a softened (box-blurred) ruby slot for few-gray e-ink.
@@ -129,7 +131,7 @@ void rubyToggleSetMode(bool enabled)
 
 void rubyToggleSetObscureStyle(int style)
 {
-    if (style < RUBY_TOGGLE_OBSCURE_HIDDEN || style > RUBY_TOGGLE_OBSCURE_NOISE)
+    if (style < RUBY_TOGGLE_OBSCURE_HIDDEN || style > RUBY_TOGGLE_OBSCURE_FOG)
         style = RUBY_TOGGLE_OBSCURE_HIDDEN;
     g_ruby_toggle_obscure = style;
 }
@@ -187,6 +189,63 @@ static void rubyToggleDrawBar(LVDrawBuf * buf, int x0, int y0, int x1, int y1)
     if (!buf || x1 <= x0 || y1 <= y0)
         return;
     buf->FillRect(x0, y0, x1, y1, 0x888888);
+}
+
+// Fine Bayer fog stand-in: no glyphs, just a light gray field as B/W dots.
+// Intensity = approximate % black (typical 15–35 for a soft clean veil).
+static void rubyToggleDrawFog(LVDrawBuf * buf, int x0, int y0, int x1, int y1)
+{
+    if (!buf || x1 <= x0 || y1 <= y0)
+        return;
+    int intensity = g_ruby_toggle_dither_intensity;
+    if (intensity <= 0)
+        return;
+    if (intensity > 100)
+        intensity = 100;
+
+    static const int M[8][8] = {
+        {  0, 32,  8, 40,  2, 34, 10, 42 },
+        { 48, 16, 56, 24, 50, 18, 58, 26 },
+        { 12, 44,  4, 36, 14, 46,  6, 38 },
+        { 60, 28, 52, 20, 62, 30, 54, 22 },
+        {  3, 35, 11, 43,  1, 33,  9, 41 },
+        { 51, 19, 59, 27, 49, 17, 57, 25 },
+        { 15, 47,  7, 39, 13, 45,  5, 37 },
+        { 63, 31, 55, 23, 61, 29, 53, 21 },
+    };
+
+    const int bw = buf->GetWidth();
+    const int bh = buf->GetHeight();
+    if (x0 < 0)
+        x0 = 0;
+    if (y0 < 0)
+        y0 = 0;
+    if (x1 > bw)
+        x1 = bw;
+    if (y1 > bh)
+        y1 = bh;
+    if (x1 <= x0 || y1 <= y0)
+        return;
+
+    const lUInt32 black = 0x00000000;
+    // First clear the slot to page white so leftover body ink under rt
+    // does not show through the light fog.
+    buf->FillRect(x0, y0, x1, y1, 0x00FFFFFF);
+    for (int ay = y0; ay < y1; ay++) {
+        for (int ax = x0; ax < x1; ax++) {
+            int t = (M[ay & 7][ax & 7] * 100) / 64;
+            if (intensity > t)
+                buf->FillRect(ax, ay, ax + 1, ay + 1, black);
+        }
+    }
+}
+
+static void rubyToggleDrawStandIn(LVDrawBuf * buf, int x0, int y0, int x1, int y1)
+{
+    if (g_ruby_toggle_obscure == RUBY_TOGGLE_OBSCURE_FOG)
+        rubyToggleDrawFog(buf, x0, y0, x1, y1);
+    else
+        rubyToggleDrawBar(buf, x0, y0, x1, y1);
 }
 
 // Separable box blur over a rectangle (edge-clamped). Expands by radius so
@@ -7540,11 +7599,14 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                 // Furigana Tool: hide/obscure suppressed <rt> paint. Text words
                 // fall through so vertical draw-state still advances.
                 // - Hidden: skip ink
-                // - Bar: skip ink, paint solid gray
+                // - Bar / Fog: skip ink, paint solid gray or fine Bayer fog
                 // - Blur/dissolve/dither: paint glyphs then post-process the slot
                 const bool ruby_suppress = rubyToggleShouldSuppress((ldomNode *)srcline->object);
                 const bool ruby_bar = ruby_suppress
                         && g_ruby_toggle_obscure == RUBY_TOGGLE_OBSCURE_BAR;
+                const bool ruby_fog = ruby_suppress
+                        && g_ruby_toggle_obscure == RUBY_TOGGLE_OBSCURE_FOG;
+                const bool ruby_standin = ruby_bar || ruby_fog;
                 const bool ruby_post = ruby_suppress
                         && rubyToggleIsPostProcessStyle(g_ruby_toggle_obscure);
                 const bool ruby_hide_ink = ruby_suppress && !ruby_post;
@@ -7552,7 +7614,7 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                     continue;
                 if (word->flags & LTEXT_WORD_IS_IMAGE)
                 {
-                    if (ruby_hide_ink && !ruby_bar)
+                    if (ruby_hide_ink && !ruby_standin)
                         continue;
                     ldomNode * node = (ldomNode *) srcline->object;
                     if (node) {
@@ -7565,8 +7627,8 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                             int column_clip_right = draw_extra_info && draw_extra_info->vert_column_clip_right
                                     ? draw_extra_info->vert_column_clip_right : clip.right;
                             applyVerticalImageDraw(frmline, word, y, line_x, column_clip_right, vstate, x0, y0);
-                            if (ruby_bar) {
-                                rubyToggleDrawBar(buf, x0, y0, x0 + (int)word->width, y0 + (int)word->o.height);
+                            if (ruby_standin) {
+                                rubyToggleDrawStandIn(buf, x0, y0, x0 + (int)word->width, y0 + (int)word->o.height);
                             } else {
                                 if ( verticalTextDebugEnabled() ) {
                                 lString32 img_class = node->getAttributeValue(attr_class);
@@ -7596,8 +7658,8 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                         } else {
                             int xx = x + frmline->x + word->x;
                             int yy = line_y + frmline->baseline - word->o.height + word->y;
-                            if (ruby_bar)
-                                rubyToggleDrawBar(buf, xx, yy, xx + (int)word->width, yy + (int)word->o.height);
+                            if (ruby_standin)
+                                rubyToggleDrawStandIn(buf, xx, yy, xx + (int)word->width, yy + (int)word->o.height);
                             else {
                                 buf->Draw( img, xx, yy, word->width, word->o.height );
                                 if (ruby_post)
@@ -7609,7 +7671,7 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                 }
                 else if (word->flags & LTEXT_WORD_IS_INLINE_BOX)
                 {
-                    if (ruby_hide_ink && !ruby_bar)
+                    if (ruby_hide_ink && !ruby_standin)
                         continue;
                     ldomNode * node = (ldomNode *) srcline->object;
                     // Logically, the coordinates of the top left of the box are:
@@ -7651,7 +7713,7 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                         getAbsMarksFromMarks(marks, absmarks, node);
                         absmarks_update_needed = false;
                     }
-                    if (ruby_bar) {
+                    if (ruby_standin) {
                         int bw = (int)word->width;
                         int bh = (int)word->o.height;
                         if (bw <= 0)
@@ -7660,9 +7722,9 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                             bh = bw;
                         // Vertical-rl: word->width advances down the column (screen Y).
                         if (is_vertical)
-                            rubyToggleDrawBar(buf, x0, y0, x0 + bh, y0 + bw);
+                            rubyToggleDrawStandIn(buf, x0, y0, x0 + bh, y0 + bw);
                         else
-                            rubyToggleDrawBar(buf, x0, y0, x0 + bw, y0 + bh);
+                            rubyToggleDrawStandIn(buf, x0, y0, x0 + bw, y0 + bh);
                     }
                     else if ( srcline->o.objflags & LTEXT_OBJECT_IS_EMBEDDED_BLOCK ) {
                         // With embedded blocks, we shouldn't drop the clip (as we do next
@@ -7842,7 +7904,7 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                         // paint a bar, draw+post-process, or skip ink for suppressed <rt>.
                         int box_w = 0;
                         int box_h = 0;
-                        if ((ruby_bar || ruby_post) && font) {
+                        if ((ruby_standin || ruby_post) && font) {
                             if (is_vertical) {
                                 box_w = font->getSize();
                                 box_h = (int)word->width > 0 ? (int)word->width : font->getSize();
@@ -7853,8 +7915,8 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                         }
 
                         if (ruby_hide_ink) {
-                            if (ruby_bar && !vert_skip_draw && font)
-                                rubyToggleDrawBar(buf, x0, y0, x0 + box_w, y0 + box_h);
+                            if (ruby_standin && !vert_skip_draw && font)
+                                rubyToggleDrawStandIn(buf, x0, y0, x0 + box_w, y0 + box_h);
                             if (word_is_latin_in_vertical) {
                                 applyVerticalLatinPostDraw((int)word->width, (int)word->width, vstate, clip, y);
                             }
