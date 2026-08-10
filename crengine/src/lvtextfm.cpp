@@ -71,12 +71,26 @@ enum RubyToggleObscureStyle {
     RUBY_TOGGLE_OBSCURE_NOISE = 9,
 };
 
+// How to re-encode a softened (box-blurred) ruby slot for few-gray e-ink.
+enum RubyToggleBlurDither {
+    RUBY_TOGGLE_BLUR_DITHER_NONE = 0,
+    RUBY_TOGGLE_BLUR_DITHER_DISSOLVE = 1,
+    RUBY_TOGGLE_BLUR_DITHER_BAYER2 = 2,
+    RUBY_TOGGLE_BLUR_DITHER_BAYER4 = 3,
+    RUBY_TOGGLE_BLUR_DITHER_BAYER8 = 4,
+    RUBY_TOGGLE_BLUR_DITHER_CHECKER = 5,
+    RUBY_TOGGLE_BLUR_DITHER_HATCH = 6,
+    RUBY_TOGGLE_BLUR_DITHER_NOISE = 7,
+};
+
 static bool g_ruby_toggle_mode = false;
 static int g_ruby_toggle_obscure = RUBY_TOGGLE_OBSCURE_HIDDEN;
 static int g_ruby_toggle_blur_radius = 2;
 static int g_ruby_toggle_blur_passes = 2;
 // Shared by dissolve / dither styles: 0 = keep ink, 100 = fully obscure.
 static int g_ruby_toggle_dither_intensity = 70;
+// Blur hide style only: NONE leaves soft grays; others ordered-dither them to B/W.
+static int g_ruby_toggle_blur_dither = RUBY_TOGGLE_BLUR_DITHER_BAYER4;
 static std::set<const ldomNode *> g_ruby_toggle_revealed;
 
 static bool rubyToggleIsPostProcessStyle(int style)
@@ -142,6 +156,13 @@ void rubyToggleSetDitherParams(int intensity)
     if (intensity > 100)
         intensity = 100;
     g_ruby_toggle_dither_intensity = intensity;
+}
+
+void rubyToggleSetBlurDither(int mode)
+{
+    if (mode < RUBY_TOGGLE_BLUR_DITHER_NONE || mode > RUBY_TOGGLE_BLUR_DITHER_NOISE)
+        mode = RUBY_TOGGLE_BLUR_DITHER_NONE;
+    g_ruby_toggle_blur_dither = mode;
 }
 
 void rubyToggleClear()
@@ -388,11 +409,120 @@ static void rubyToggleDitherRect(LVDrawBuf * buf, int x0, int y0, int x1, int y1
     }
 }
 
+// Ordered / stochastic threshold for continuous-tone → B/W (0..255).
+static int rubyToggleToneThresh255(int mode, int ax, int ay)
+{
+    switch (mode) {
+    case RUBY_TOGGLE_BLUR_DITHER_BAYER2: {
+        static const int M[2][2] = { { 0, 2 }, { 3, 1 } };
+        return (M[ay & 1][ax & 1] * 255 + 2) / 4;
+    }
+    case RUBY_TOGGLE_BLUR_DITHER_BAYER4: {
+        static const int M[4][4] = {
+            {  0,  8,  2, 10 },
+            { 12,  4, 14,  6 },
+            {  3, 11,  1,  9 },
+            { 15,  7, 13,  5 },
+        };
+        return (M[ay & 3][ax & 3] * 255 + 8) / 16;
+    }
+    case RUBY_TOGGLE_BLUR_DITHER_BAYER8: {
+        static const int M[8][8] = {
+            {  0, 32,  8, 40,  2, 34, 10, 42 },
+            { 48, 16, 56, 24, 50, 18, 58, 26 },
+            { 12, 44,  4, 36, 14, 46,  6, 38 },
+            { 60, 28, 52, 20, 62, 30, 54, 22 },
+            {  3, 35, 11, 43,  1, 33,  9, 41 },
+            { 51, 19, 59, 27, 49, 17, 57, 25 },
+            { 15, 47,  7, 39, 13, 45,  5, 37 },
+            { 63, 31, 55, 23, 61, 29, 53, 21 },
+        };
+        return (M[ay & 7][ax & 7] * 255 + 32) / 64;
+    }
+    case RUBY_TOGGLE_BLUR_DITHER_CHECKER:
+        return ((ax + ay) & 1) ? 64 : 192;
+    case RUBY_TOGGLE_BLUR_DITHER_HATCH: {
+        int phase = (ax + ay) & 3;
+        return 32 + phase * 56; // ~32,88,144,200
+    }
+    case RUBY_TOGGLE_BLUR_DITHER_DISSOLVE:
+        return (int)(rubyToggleHashXY(ax, ay) % 256u);
+    case RUBY_TOGGLE_BLUR_DITHER_NOISE: {
+        lUInt32 h = rubyToggleHashXY(ax * 3 + 1, ay * 5 + 7);
+        h ^= h << 13;
+        h ^= h >> 17;
+        h ^= h << 5;
+        return (int)(h % 256u);
+    }
+    default:
+        return 128;
+    }
+}
+
+// After box-blur: map soft mid-grays to B/W with the chosen spatial pattern so
+// e-ink can approximate the blur (continuous gray would crush to ink).
+static void rubyToggleToneDitherRect(LVDrawBuf * buf, int x0, int y0, int x1, int y1)
+{
+    if (!buf || x1 <= x0 || y1 <= y0)
+        return;
+    const int mode = g_ruby_toggle_blur_dither;
+    if (mode == RUBY_TOGGLE_BLUR_DITHER_NONE)
+        return;
+
+    const int intensity = g_ruby_toggle_dither_intensity;
+    // 0 = leave soft grays from blur (no B/W re-encode).
+    if (intensity <= 0)
+        return;
+
+    // Expand like the blur so soft fringes are quantized too.
+    const int radius = g_ruby_toggle_blur_radius > 0 ? g_ruby_toggle_blur_radius : 0;
+    x0 -= radius;
+    y0 -= radius;
+    x1 += radius;
+    y1 += radius;
+
+    const int bw = buf->GetWidth();
+    const int bh = buf->GetHeight();
+    if (x0 < 0)
+        x0 = 0;
+    if (y0 < 0)
+        y0 = 0;
+    if (x1 > bw)
+        x1 = bw;
+    if (y1 > bh)
+        y1 = bh;
+    const int w = x1 - x0;
+    const int h = y1 - y0;
+    if (w < 1 || h < 1 || w > 512 || h > 512)
+        return;
+
+    const lUInt32 white = 0x00FFFFFF;
+    const lUInt32 black = 0x00000000;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            const int ax = x0 + x;
+            const int ay = y0 + y;
+            lUInt32 p = buf->GetPixel(ax, ay);
+            int luma = rubyTogglePixelLuma(p);
+            // Leave page background alone.
+            if (luma >= 250)
+                continue;
+            // Intensity pulls toward white before thresholding (lighter pattern).
+            if (intensity < 100)
+                luma = luma + (255 - luma) * (100 - intensity) / 100;
+            const int thr = rubyToggleToneThresh255(mode, ax, ay);
+            buf->FillRect(ax, ay, ax + 1, ay + 1, (luma < thr) ? black : white);
+        }
+    }
+}
+
 static void rubyTogglePostProcessRect(LVDrawBuf * buf, int x0, int y0, int x1, int y1)
 {
     switch (g_ruby_toggle_obscure) {
     case RUBY_TOGGLE_OBSCURE_BLUR:
         rubyToggleBoxBlurRect(buf, x0, y0, x1, y1);
+        if (g_ruby_toggle_blur_dither != RUBY_TOGGLE_BLUR_DITHER_NONE)
+            rubyToggleToneDitherRect(buf, x0, y0, x1, y1);
         break;
     case RUBY_TOGGLE_OBSCURE_DISSOLVE:
     case RUBY_TOGGLE_OBSCURE_BAYER2:
