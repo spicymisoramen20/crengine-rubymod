@@ -74,6 +74,17 @@ static int g_ruby_toggle_dither_intensity = 70;
 // Fog shape: soft edge band and corner radius in pixels.
 static int g_ruby_toggle_fog_falloff = 4;
 static int g_ruby_toggle_fog_roundness = 5;
+// Fog fill pattern (see RubyToggleFogPattern).
+enum RubyToggleFogPattern {
+    RUBY_FOG_BAYER8 = 0,
+    RUBY_FOG_BAYER16 = 1,
+    RUBY_FOG_BLUE_NOISE = 2,
+    RUBY_FOG_CHECKER = 3,
+    RUBY_FOG_HATCH45 = 4,
+    // 4 midtone levels (page / light / mid / black) — uses GC-friendly grays.
+    RUBY_FOG_MULTI4 = 5,
+};
+static int g_ruby_toggle_fog_pattern = RUBY_FOG_BAYER8;
 static std::set<const ldomNode *> g_ruby_toggle_revealed;
 
 static ldomNode * rubyToggleFindAncestor(ldomNode * node, const char * name)
@@ -114,7 +125,7 @@ void rubyToggleSetDitherParams(int intensity)
     g_ruby_toggle_dither_intensity = intensity;
 }
 
-void rubyToggleSetFogParams(int falloff, int roundness)
+void rubyToggleSetFogParams(int falloff, int roundness, int pattern)
 {
     if (falloff < 0)
         falloff = 0;
@@ -124,8 +135,11 @@ void rubyToggleSetFogParams(int falloff, int roundness)
         roundness = 0;
     if (roundness > 64)
         roundness = 64;
+    if (pattern < RUBY_FOG_BAYER8 || pattern > RUBY_FOG_MULTI4)
+        pattern = RUBY_FOG_BAYER8;
     g_ruby_toggle_fog_falloff = falloff;
     g_ruby_toggle_fog_roundness = roundness;
+    g_ruby_toggle_fog_pattern = pattern;
 }
 
 void rubyToggleClear()
@@ -152,9 +166,9 @@ static void rubyToggleDrawBar(LVDrawBuf * buf, int x0, int y0, int x1, int y1)
     buf->FillRect(x0, y0, x1, y1, 0x888888);
 }
 
-// Fine Bayer fog stand-in: no glyphs, light gray field as B/W dots.
-// Intensity ≈ % black in the core. Falloff softens density near the
-// boundary; roundness uses a rounded-rect silhouette (no hard box corners).
+// Fog stand-in: no glyphs. Intensity ≈ % ink in the core. Falloff softens
+// density near the boundary; roundness uses a rounded-rect silhouette.
+// Pattern selects ordered/stochastic B/W dither or 4-level midtone dither.
 static float rubyToggleSdRoundBox(float px, float py, float hx, float hy, float r)
 {
     if (r < 0.f)
@@ -173,6 +187,78 @@ static float rubyToggleSdRoundBox(float px, float py, float hx, float hy, float 
     return inside + outside - r;
 }
 
+// Threshold 0..99 for B/W ordered / hatch patterns (higher = rarer ink).
+static int rubyToggleFogThreshold(int pattern, int ax, int ay)
+{
+    static const unsigned char BAYER8[8][8] = {
+        {  0, 32,  8, 40,  2, 34, 10, 42 },
+        { 48, 16, 56, 24, 50, 18, 58, 26 },
+        { 12, 44,  4, 36, 14, 46,  6, 38 },
+        { 60, 28, 52, 20, 62, 30, 54, 22 },
+        {  3, 35, 11, 43,  1, 33,  9, 41 },
+        { 51, 19, 59, 27, 49, 17, 57, 25 },
+        { 15, 47,  7, 39, 13, 45,  5, 37 },
+        { 63, 31, 55, 23, 61, 29, 53, 21 },
+    };
+    static const unsigned char BAYER16[16][16] = {
+        {   0, 128,  32, 160,   8, 136,  40, 168,   2, 130,  34, 162,  10, 138,  42, 170 },
+        { 192,  64, 224,  96, 200,  72, 232, 104, 194,  66, 226,  98, 202,  74, 234, 106 },
+        {  48, 176,  16, 144,  56, 184,  24, 152,  50, 178,  18, 146,  58, 186,  26, 154 },
+        { 240, 112, 208,  80, 248, 120, 216,  88, 242, 114, 210,  82, 250, 122, 218,  90 },
+        {  12, 140,  44, 172,   4, 132,  36, 164,  14, 142,  46, 174,   6, 134,  38, 166 },
+        { 204,  76, 236, 108, 196,  68, 228, 100, 206,  78, 238, 110, 198,  70, 230, 102 },
+        {  60, 188,  28, 156,  52, 180,  20, 148,  62, 190,  30, 158,  54, 182,  22, 150 },
+        { 252, 124, 220,  92, 244, 116, 212,  84, 254, 126, 222,  94, 246, 118, 214,  86 },
+        {   3, 131,  35, 163,  11, 139,  43, 171,   1, 129,  33, 161,   9, 137,  41, 169 },
+        { 195,  67, 227,  99, 203,  75, 235, 107, 193,  65, 225,  97, 201,  73, 233, 105 },
+        {  51, 179,  19, 147,  59, 187,  27, 155,  49, 177,  17, 145,  57, 185,  25, 153 },
+        { 243, 115, 211,  83, 251, 123, 219,  91, 241, 113, 209,  81, 249, 121, 217,  89 },
+        {  15, 143,  47, 175,   7, 135,  39, 167,  13, 141,  45, 173,   5, 133,  37, 165 },
+        { 207,  79, 239, 111, 199,  71, 231, 103, 205,  77, 237, 109, 197,  69, 229, 101 },
+        {  63, 191,  31, 159,  55, 183,  23, 151,  61, 189,  29, 157,  53, 181,  21, 149 },
+        { 255, 127, 223,  95, 247, 119, 215,  87, 253, 125, 221,  93, 245, 117, 213,  85 },
+    };
+    // Compact void-and-cluster-ish ranks (0..255), tiled.
+    static const unsigned char BN16[16][16] = {
+        { 155,  59, 165,   2, 207,  33, 218,   7, 228,  37, 240,   0, 250,  48, 135,  11 },
+        { 103, 247, 108, 166, 111, 176, 114, 187,  72, 197,  80, 209,  87, 219,  94, 139 },
+        { 248,  24, 133,  54, 145,  26, 189,  61, 198,  29, 210,  34, 220,  19, 230,  43 },
+        { 106, 161, 110, 171, 113, 181,  69, 192,  75, 204,  83, 215,  90, 131,  97, 144 },
+        { 128,  50, 140,  12, 182,  57, 193,   6, 205,  31, 216,   8, 225,  41, 235,   4 },
+        {  89, 129,  95, 141, 101, 151, 107, 162, 121, 172,  63, 183,  70, 194,  76, 237 },
+        { 253,  18, 137,  55, 148,  27, 158,  62, 201,  30, 212,  35, 223,  16, 232,  45 },
+        {  93, 138, 100, 150, 105, 160, 120, 169, 126, 179,  68, 190,  74, 233,  82, 245 },
+        { 130,  52, 142,   0, 152,  58, 195,  14, 206,  32, 217,   1, 227,  42, 238,   9 },
+        {  96, 143, 102, 154, 117, 164, 122, 174,  64, 185,  71, 229,  78, 239,  85, 249 },
+        { 226,  21, 236,  47, 246,  23, 132,  53, 175,  25, 186,  60, 196,  28, 208,  39 },
+        {  77, 241,  84, 251,  91, 134, 112, 146, 115, 156, 118, 199, 123, 211,  65, 221 },
+        { 231,  44, 244,  10, 127,  49, 170,   5, 180,  56, 191,  13, 203,  38, 214,   3 },
+        {  98, 147, 104, 157, 109, 167, 124, 177,  66, 188,  73, 200,  81, 243,  88, 254 },
+        { 202,  17, 213,  40, 224,  20, 234,  46, 153,  22, 163,  51, 173,  15, 184,  36 },
+        {  79, 242,  86, 252,  92, 136,  99, 149, 116, 159, 119, 168, 125, 178,  67, 222 },
+    };
+
+    switch (pattern) {
+    case RUBY_FOG_BAYER16:
+        return ((int)BAYER16[ay & 15][ax & 15] * 100) / 256;
+    case RUBY_FOG_BLUE_NOISE:
+        return ((int)BN16[ay & 15][ax & 15] * 100) / 256;
+    case RUBY_FOG_CHECKER: {
+        // 2×2 checker cells; intensity still ≈ fill % of the silhouette.
+        bool dark = ((ax ^ ay) & 1) != 0;
+        if (!dark)
+            return 100;
+        return ((int)BAYER8[ay & 7][ax & 7] * 100) / 128;
+    }
+    case RUBY_FOG_HATCH45:
+        // Diagonal bands (ax+ay), fine period — print-like strokes.
+        return ((((ax + ay) & 7) * 100) / 8);
+    case RUBY_FOG_BAYER8:
+    default:
+        return ((int)BAYER8[ay & 7][ax & 7] * 100) / 64;
+    }
+}
+
 static void rubyToggleDrawFog(LVDrawBuf * buf, int x0, int y0, int x1, int y1)
 {
     if (!buf || x1 <= x0 || y1 <= y0)
@@ -183,17 +269,7 @@ static void rubyToggleDrawFog(LVDrawBuf * buf, int x0, int y0, int x1, int y1)
     if (intensity > 100)
         intensity = 100;
 
-    static const int M[8][8] = {
-        {  0, 32,  8, 40,  2, 34, 10, 42 },
-        { 48, 16, 56, 24, 50, 18, 58, 26 },
-        { 12, 44,  4, 36, 14, 46,  6, 38 },
-        { 60, 28, 52, 20, 62, 30, 54, 22 },
-        {  3, 35, 11, 43,  1, 33,  9, 41 },
-        { 51, 19, 59, 27, 49, 17, 57, 25 },
-        { 15, 47,  7, 39, 13, 45,  5, 37 },
-        { 63, 31, 55, 23, 61, 29, 53, 21 },
-    };
-
+    const int pattern = g_ruby_toggle_fog_pattern;
     const int bw = buf->GetWidth();
     const int bh = buf->GetHeight();
     if (x0 < 0)
@@ -218,9 +294,13 @@ static void rubyToggleDrawFog(LVDrawBuf * buf, int x0, int y0, int x1, int y1)
     if (falloff < 0.f)
         falloff = 0.f;
 
-    const lUInt32 black = 0x00000000;
-    // Do not white-out a hard rect — that made the fog look boxy. Stamp
-    // dots only; page / surrounding ink shows through the soft edge.
+    // GC-friendly midtones (same family as Bar's 0x888888).
+    // level 1 = light gray, 2 = mid, 3 = solid black (via `black`).
+    static const lUInt32 GRAY_LIGHT = 0xCCCCCC;
+    static const lUInt32 GRAY_MID = 0x888888;
+
+    const lUInt32 black = 0x000000;
+    // Stamp pattern only — no hard white outpaint (keeps soft silhouette).
     for (int ay = y0; ay < y1; ay++) {
         for (int ax = x0; ax < x1; ax++) {
             float sd = rubyToggleSdRoundBox((float)ax - cx, (float)ay - cy, hx, hy, roundness);
@@ -238,7 +318,29 @@ static void rubyToggleDrawFog(LVDrawBuf * buf, int x0, int y0, int x1, int y1)
             int local_i = (int)((float)intensity * coverage + 0.5f);
             if (local_i <= 0)
                 continue;
-            int t = (M[ay & 7][ax & 7] * 100) / 64;
+
+            if (pattern == RUBY_FOG_MULTI4) {
+                // Continuous ink 0..3, residual fraction ordered-dithered.
+                float scaled = (float)local_i * 3.f / 100.f;
+                int lo = (int)scaled;
+                if (lo > 3)
+                    lo = 3;
+                float frac = scaled - (float)lo;
+                int thr = rubyToggleFogThreshold(RUBY_FOG_BAYER8, ax, ay);
+                if (frac * 100.f > (float)thr && lo < 3)
+                    lo++;
+                if (lo <= 0)
+                    continue;
+                lUInt32 col = black;
+                if (lo == 1)
+                    col = GRAY_LIGHT;
+                else if (lo == 2)
+                    col = GRAY_MID;
+                buf->FillRect(ax, ay, ax + 1, ay + 1, col);
+                continue;
+            }
+
+            int t = rubyToggleFogThreshold(pattern, ax, ay);
             if (local_i > t)
                 buf->FillRect(ax, ay, ax + 1, ay + 1, black);
         }
