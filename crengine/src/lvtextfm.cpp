@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <map>
 #include <set>
 #include <vector>
 #include "../include/crsetup.h"
@@ -62,54 +63,18 @@ static bool verticalTextDebugEnabled()
 enum RubyToggleObscureStyle {
     RUBY_TOGGLE_OBSCURE_HIDDEN = 0,
     RUBY_TOGGLE_OBSCURE_BAR = 1,
-    RUBY_TOGGLE_OBSCURE_BLUR = 2,
-    RUBY_TOGGLE_OBSCURE_DISSOLVE = 3,
-    RUBY_TOGGLE_OBSCURE_BAYER2 = 4,
-    RUBY_TOGGLE_OBSCURE_BAYER4 = 5,
-    RUBY_TOGGLE_OBSCURE_BAYER8 = 6,
-    RUBY_TOGGLE_OBSCURE_CHECKER = 7,
-    RUBY_TOGGLE_OBSCURE_HATCH = 8,
-    RUBY_TOGGLE_OBSCURE_NOISE = 9,
     // Skip <rt> ink; fill the slot with a fine light Bayer fog (e-ink-friendly).
-    RUBY_TOGGLE_OBSCURE_FOG = 10,
-};
-
-// How to re-encode a softened (box-blurred) ruby slot for few-gray e-ink.
-enum RubyToggleBlurDither {
-    RUBY_TOGGLE_BLUR_DITHER_NONE = 0,
-    RUBY_TOGGLE_BLUR_DITHER_DISSOLVE = 1,
-    RUBY_TOGGLE_BLUR_DITHER_BAYER2 = 2,
-    RUBY_TOGGLE_BLUR_DITHER_BAYER4 = 3,
-    RUBY_TOGGLE_BLUR_DITHER_BAYER8 = 4,
-    RUBY_TOGGLE_BLUR_DITHER_CHECKER = 5,
-    RUBY_TOGGLE_BLUR_DITHER_HATCH = 6,
-    RUBY_TOGGLE_BLUR_DITHER_NOISE = 7,
+    RUBY_TOGGLE_OBSCURE_FOG = 2,
 };
 
 static bool g_ruby_toggle_mode = false;
 static int g_ruby_toggle_obscure = RUBY_TOGGLE_OBSCURE_HIDDEN;
-static int g_ruby_toggle_blur_radius = 2;
-static int g_ruby_toggle_blur_passes = 2;
-// Shared by dissolve / dither styles: 0 = keep ink, 100 = fully obscure.
+// Fog density: 0 = no veil, 100 = fully opaque.
 static int g_ruby_toggle_dither_intensity = 70;
-// Blur hide style only: NONE leaves soft grays; others ordered-dither them to B/W.
-static int g_ruby_toggle_blur_dither = RUBY_TOGGLE_BLUR_DITHER_BAYER4;
 // Fog shape: soft edge band and corner radius in pixels.
 static int g_ruby_toggle_fog_falloff = 4;
 static int g_ruby_toggle_fog_roundness = 5;
 static std::set<const ldomNode *> g_ruby_toggle_revealed;
-
-static bool rubyToggleIsPostProcessStyle(int style)
-{
-    return style == RUBY_TOGGLE_OBSCURE_BLUR
-            || style == RUBY_TOGGLE_OBSCURE_DISSOLVE
-            || style == RUBY_TOGGLE_OBSCURE_BAYER2
-            || style == RUBY_TOGGLE_OBSCURE_BAYER4
-            || style == RUBY_TOGGLE_OBSCURE_BAYER8
-            || style == RUBY_TOGGLE_OBSCURE_CHECKER
-            || style == RUBY_TOGGLE_OBSCURE_HATCH
-            || style == RUBY_TOGGLE_OBSCURE_NOISE;
-}
 
 static ldomNode * rubyToggleFindAncestor(ldomNode * node, const char * name)
 {
@@ -140,21 +105,6 @@ void rubyToggleSetObscureStyle(int style)
     g_ruby_toggle_obscure = style;
 }
 
-void rubyToggleSetBlurParams(int radius, int passes)
-{
-    // Hard safety clamps (UI can offer wide ranges within these).
-    if (radius < 0)
-        radius = 0;
-    if (radius > 64)
-        radius = 64;
-    if (passes < 1)
-        passes = 1;
-    if (passes > 20)
-        passes = 20;
-    g_ruby_toggle_blur_radius = radius;
-    g_ruby_toggle_blur_passes = passes;
-}
-
 void rubyToggleSetDitherParams(int intensity)
 {
     if (intensity < 0)
@@ -162,13 +112,6 @@ void rubyToggleSetDitherParams(int intensity)
     if (intensity > 100)
         intensity = 100;
     g_ruby_toggle_dither_intensity = intensity;
-}
-
-void rubyToggleSetBlurDither(int mode)
-{
-    if (mode < RUBY_TOGGLE_BLUR_DITHER_NONE || mode > RUBY_TOGGLE_BLUR_DITHER_NOISE)
-        mode = RUBY_TOGGLE_BLUR_DITHER_NONE;
-    g_ruby_toggle_blur_dither = mode;
 }
 
 void rubyToggleSetFogParams(int falloff, int roundness)
@@ -310,353 +253,77 @@ static void rubyToggleDrawStandIn(LVDrawBuf * buf, int x0, int y0, int x1, int y
         rubyToggleDrawBar(buf, x0, y0, x1, y1);
 }
 
-// Separable box blur over a rectangle (edge-clamped). Expands by radius so
-// glyphs soften into the surrounding page instead of leaving a hard edge.
-static void rubyToggleBoxBlurRect(LVDrawBuf * buf, int x0, int y0, int x1, int y1)
+// Contiguous sibling <ruby> elements (mono-ruby word). Head is used as the
+// union key so Bar/Fog paint one block for the whole visual word.
+static ldomNode * rubyToggleGroupHead(ldomNode * node)
 {
-    if (!buf)
-        return;
-    int radius = g_ruby_toggle_blur_radius;
-    int passes = g_ruby_toggle_blur_passes;
-    if (radius < 1 || passes < 1 || x1 <= x0 || y1 <= y0)
-        return;
-
-    const int bw = buf->GetWidth();
-    const int bh = buf->GetHeight();
-    x0 -= radius;
-    y0 -= radius;
-    x1 += radius;
-    y1 += radius;
-    if (x0 < 0)
-        x0 = 0;
-    if (y0 < 0)
-        y0 = 0;
-    if (x1 > bw)
-        x1 = bw;
-    if (y1 > bh)
-        y1 = bh;
-    const int w = x1 - x0;
-    const int h = y1 - y0;
-    if (w < 1 || h < 1)
-        return;
-
-    // Guard against pathological sizes (should only be ruby slots).
-    if (w > 512 || h > 512)
-        return;
-
-    std::vector<lUInt32> src((size_t)w * (size_t)h);
-    std::vector<lUInt32> dst((size_t)w * (size_t)h);
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++)
-            src[(size_t)y * (size_t)w + (size_t)x] = buf->GetPixel(x0 + x, y0 + y);
+    ldomNode * ruby = rubyToggleFindAncestor(node, "ruby");
+    if (!ruby)
+        return NULL;
+    ldomNode * parent = ruby->getParentNode();
+    if (!parent)
+        return ruby;
+    int index = ruby->getNodeIndex();
+    int first = index;
+    while (first > 0) {
+        ldomNode * prev = parent->getChildNode(first - 1);
+        if (!prev || !prev->isElement() || prev->getNodeName() != "ruby")
+            break;
+        first--;
     }
-
-    const int diam = radius * 2 + 1;
-    for (int pass = 0; pass < passes; pass++) {
-        // Horizontal
-        for (int y = 0; y < h; y++) {
-            for (int x = 0; x < w; x++) {
-                int rsum = 0, gsum = 0, bsum = 0;
-                for (int k = -radius; k <= radius; k++) {
-                    int xx = x + k;
-                    if (xx < 0)
-                        xx = 0;
-                    else if (xx >= w)
-                        xx = w - 1;
-                    lUInt32 p = src[(size_t)y * (size_t)w + (size_t)xx];
-                    rsum += (int)((p >> 16) & 0xFF);
-                    gsum += (int)((p >> 8) & 0xFF);
-                    bsum += (int)(p & 0xFF);
-                }
-                dst[(size_t)y * (size_t)w + (size_t)x] =
-                    ((lUInt32)(rsum / diam) << 16)
-                    | ((lUInt32)(gsum / diam) << 8)
-                    | (lUInt32)(bsum / diam);
-            }
-        }
-        src.swap(dst);
-        // Vertical
-        for (int y = 0; y < h; y++) {
-            for (int x = 0; x < w; x++) {
-                int rsum = 0, gsum = 0, bsum = 0;
-                for (int k = -radius; k <= radius; k++) {
-                    int yy = y + k;
-                    if (yy < 0)
-                        yy = 0;
-                    else if (yy >= h)
-                        yy = h - 1;
-                    lUInt32 p = src[(size_t)yy * (size_t)w + (size_t)x];
-                    rsum += (int)((p >> 16) & 0xFF);
-                    gsum += (int)((p >> 8) & 0xFF);
-                    bsum += (int)(p & 0xFF);
-                }
-                dst[(size_t)y * (size_t)w + (size_t)x] =
-                    ((lUInt32)(rsum / diam) << 16)
-                    | ((lUInt32)(gsum / diam) << 8)
-                    | (lUInt32)(bsum / diam);
-            }
-        }
-        src.swap(dst);
-    }
-
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            lUInt32 c = src[(size_t)y * (size_t)w + (size_t)x];
-            buf->FillRect(x0 + x, y0 + y, x0 + x + 1, y0 + y + 1, c);
-        }
-    }
+    ldomNode * head = parent->getChildNode(first);
+    return head ? head : ruby;
 }
 
-// Deterministic 32-bit mix — stable across redraws (unlike rand()).
-static lUInt32 rubyToggleHashXY(int x, int y)
+struct RubyToggleStandInRect {
+    int x0;
+    int y0;
+    int x1;
+    int y1;
+    bool valid;
+    RubyToggleStandInRect()
+        : x0(0), y0(0), x1(0), y1(0), valid(false) {}
+};
+
+typedef std::map<const ldomNode *, RubyToggleStandInRect> RubyToggleStandInMap;
+
+static void rubyToggleAccumulateStandIn(RubyToggleStandInMap & groups,
+        ldomNode * from_node, int x0, int y0, int x1, int y1)
 {
-    lUInt32 h = (lUInt32)(x * 374761393) ^ (lUInt32)(y * 668265263);
-    h = (h ^ (h >> 13)) * 1274126177u;
-    return h ^ (h >> 16);
+    if (x1 <= x0 || y1 <= y0)
+        return;
+    ldomNode * head = rubyToggleGroupHead(from_node);
+    if (!head)
+        head = from_node;
+    if (!head)
+        return;
+    RubyToggleStandInRect & r = groups[head];
+    if (!r.valid) {
+        r.x0 = x0;
+        r.y0 = y0;
+        r.x1 = x1;
+        r.y1 = y1;
+        r.valid = true;
+        return;
+    }
+    if (x0 < r.x0)
+        r.x0 = x0;
+    if (y0 < r.y0)
+        r.y0 = y0;
+    if (x1 > r.x1)
+        r.x1 = x1;
+    if (y1 > r.y1)
+        r.y1 = y1;
 }
 
-static int rubyTogglePixelLuma(lUInt32 p)
+static void rubyToggleFlushStandIns(LVDrawBuf * buf, RubyToggleStandInMap & groups)
 {
-    int r = (int)((p >> 16) & 0xFF);
-    int g = (int)((p >> 8) & 0xFF);
-    int b = (int)(p & 0xFF);
-    return (r * 3 + g * 6 + b) / 10;
-}
-
-// True → replace ink pixel with white (obscure). Patterns are e-ink-friendly
-// spatial approximations of mid-gray / partial opacity.
-static bool rubyToggleShouldBleach(int style, int ax, int ay, int intensity)
-{
-    if (intensity <= 0)
-        return false;
-    if (intensity >= 100)
-        return true;
-
-    switch (style) {
-    case RUBY_TOGGLE_OBSCURE_DISSOLVE:
-        return (int)(rubyToggleHashXY(ax, ay) % 100u) < intensity;
-    case RUBY_TOGGLE_OBSCURE_NOISE: {
-        // Extra xor-shift mix: slightly less clustered than dissolve.
-        lUInt32 h = rubyToggleHashXY(ax * 3 + 1, ay * 5 + 7);
-        h ^= h << 13;
-        h ^= h >> 17;
-        h ^= h << 5;
-        return (int)(h % 100u) < intensity;
+    for (RubyToggleStandInMap::iterator it = groups.begin(); it != groups.end(); ++it) {
+        const RubyToggleStandInRect & r = it->second;
+        if (r.valid)
+            rubyToggleDrawStandIn(buf, r.x0, r.y0, r.x1, r.y1);
     }
-    case RUBY_TOGGLE_OBSCURE_BAYER2: {
-        static const int M[2][2] = { { 0, 2 }, { 3, 1 } };
-        int t = (M[ay & 1][ax & 1] * 100) / 4;
-        return intensity > t;
-    }
-    case RUBY_TOGGLE_OBSCURE_BAYER4: {
-        static const int M[4][4] = {
-            {  0,  8,  2, 10 },
-            { 12,  4, 14,  6 },
-            {  3, 11,  1,  9 },
-            { 15,  7, 13,  5 },
-        };
-        int t = (M[ay & 3][ax & 3] * 100) / 16;
-        return intensity > t;
-    }
-    case RUBY_TOGGLE_OBSCURE_BAYER8: {
-        static const int M[8][8] = {
-            {  0, 32,  8, 40,  2, 34, 10, 42 },
-            { 48, 16, 56, 24, 50, 18, 58, 26 },
-            { 12, 44,  4, 36, 14, 46,  6, 38 },
-            { 60, 28, 52, 20, 62, 30, 54, 22 },
-            {  3, 35, 11, 43,  1, 33,  9, 41 },
-            { 51, 19, 59, 27, 49, 17, 57, 25 },
-            { 15, 47,  7, 39, 13, 45,  5, 37 },
-            { 63, 31, 55, 23, 61, 29, 53, 21 },
-        };
-        int t = (M[ay & 7][ax & 7] * 100) / 64;
-        return intensity > t;
-    }
-    case RUBY_TOGGLE_OBSCURE_CHECKER: {
-        // Low intensity → sparse checker; high → both phases bleach.
-        int phase = (ax + ay) & 1;
-        int thresh = phase ? 0 : 50;
-        return intensity > thresh;
-    }
-    case RUBY_TOGGLE_OBSCURE_HATCH: {
-        // Diagonal bands: phase maps to 0/25/50/75 thresholds.
-        int phase = (ax + ay) & 3;
-        int t = phase * 25;
-        return intensity > t;
-    }
-    default:
-        return false;
-    }
-}
-
-// Drop ink pixels according to dissolve/dither pattern. Only touches dark
-// (ink-like) pixels so antialiased page background in the slot stays put.
-static void rubyToggleDitherRect(LVDrawBuf * buf, int x0, int y0, int x1, int y1)
-{
-    if (!buf || x1 <= x0 || y1 <= y0)
-        return;
-    const int intensity = g_ruby_toggle_dither_intensity;
-    if (intensity <= 0)
-        return;
-
-    const int style = g_ruby_toggle_obscure;
-    const int bw = buf->GetWidth();
-    const int bh = buf->GetHeight();
-    if (x0 < 0)
-        x0 = 0;
-    if (y0 < 0)
-        y0 = 0;
-    if (x1 > bw)
-        x1 = bw;
-    if (y1 > bh)
-        y1 = bh;
-    const int w = x1 - x0;
-    const int h = y1 - y0;
-    if (w < 1 || h < 1 || w > 512 || h > 512)
-        return;
-
-    const lUInt32 white = 0x00FFFFFF;
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            const int ax = x0 + x;
-            const int ay = y0 + y;
-            lUInt32 p = buf->GetPixel(ax, ay);
-            // Skip near-white / page pixels.
-            if (rubyTogglePixelLuma(p) >= 200)
-                continue;
-            if (rubyToggleShouldBleach(style, ax, ay, intensity))
-                buf->FillRect(ax, ay, ax + 1, ay + 1, white);
-        }
-    }
-}
-
-// Ordered / stochastic threshold for continuous-tone → B/W (0..255).
-static int rubyToggleToneThresh255(int mode, int ax, int ay)
-{
-    switch (mode) {
-    case RUBY_TOGGLE_BLUR_DITHER_BAYER2: {
-        static const int M[2][2] = { { 0, 2 }, { 3, 1 } };
-        return (M[ay & 1][ax & 1] * 255 + 2) / 4;
-    }
-    case RUBY_TOGGLE_BLUR_DITHER_BAYER4: {
-        static const int M[4][4] = {
-            {  0,  8,  2, 10 },
-            { 12,  4, 14,  6 },
-            {  3, 11,  1,  9 },
-            { 15,  7, 13,  5 },
-        };
-        return (M[ay & 3][ax & 3] * 255 + 8) / 16;
-    }
-    case RUBY_TOGGLE_BLUR_DITHER_BAYER8: {
-        static const int M[8][8] = {
-            {  0, 32,  8, 40,  2, 34, 10, 42 },
-            { 48, 16, 56, 24, 50, 18, 58, 26 },
-            { 12, 44,  4, 36, 14, 46,  6, 38 },
-            { 60, 28, 52, 20, 62, 30, 54, 22 },
-            {  3, 35, 11, 43,  1, 33,  9, 41 },
-            { 51, 19, 59, 27, 49, 17, 57, 25 },
-            { 15, 47,  7, 39, 13, 45,  5, 37 },
-            { 63, 31, 55, 23, 61, 29, 53, 21 },
-        };
-        return (M[ay & 7][ax & 7] * 255 + 32) / 64;
-    }
-    case RUBY_TOGGLE_BLUR_DITHER_CHECKER:
-        return ((ax + ay) & 1) ? 64 : 192;
-    case RUBY_TOGGLE_BLUR_DITHER_HATCH: {
-        int phase = (ax + ay) & 3;
-        return 32 + phase * 56; // ~32,88,144,200
-    }
-    case RUBY_TOGGLE_BLUR_DITHER_DISSOLVE:
-        return (int)(rubyToggleHashXY(ax, ay) % 256u);
-    case RUBY_TOGGLE_BLUR_DITHER_NOISE: {
-        lUInt32 h = rubyToggleHashXY(ax * 3 + 1, ay * 5 + 7);
-        h ^= h << 13;
-        h ^= h >> 17;
-        h ^= h << 5;
-        return (int)(h % 256u);
-    }
-    default:
-        return 128;
-    }
-}
-
-// After box-blur: map soft mid-grays to B/W with the chosen spatial pattern so
-// e-ink can approximate the blur (continuous gray would crush to ink).
-static void rubyToggleToneDitherRect(LVDrawBuf * buf, int x0, int y0, int x1, int y1)
-{
-    if (!buf || x1 <= x0 || y1 <= y0)
-        return;
-    const int mode = g_ruby_toggle_blur_dither;
-    if (mode == RUBY_TOGGLE_BLUR_DITHER_NONE)
-        return;
-
-    const int intensity = g_ruby_toggle_dither_intensity;
-    // 0 = leave soft grays from blur (no B/W re-encode).
-    if (intensity <= 0)
-        return;
-
-    // Expand like the blur so soft fringes are quantized too.
-    const int radius = g_ruby_toggle_blur_radius > 0 ? g_ruby_toggle_blur_radius : 0;
-    x0 -= radius;
-    y0 -= radius;
-    x1 += radius;
-    y1 += radius;
-
-    const int bw = buf->GetWidth();
-    const int bh = buf->GetHeight();
-    if (x0 < 0)
-        x0 = 0;
-    if (y0 < 0)
-        y0 = 0;
-    if (x1 > bw)
-        x1 = bw;
-    if (y1 > bh)
-        y1 = bh;
-    const int w = x1 - x0;
-    const int h = y1 - y0;
-    if (w < 1 || h < 1 || w > 512 || h > 512)
-        return;
-
-    const lUInt32 white = 0x00FFFFFF;
-    const lUInt32 black = 0x00000000;
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            const int ax = x0 + x;
-            const int ay = y0 + y;
-            lUInt32 p = buf->GetPixel(ax, ay);
-            int luma = rubyTogglePixelLuma(p);
-            // Leave page background alone.
-            if (luma >= 250)
-                continue;
-            // Intensity pulls toward white before thresholding (lighter pattern).
-            if (intensity < 100)
-                luma = luma + (255 - luma) * (100 - intensity) / 100;
-            const int thr = rubyToggleToneThresh255(mode, ax, ay);
-            buf->FillRect(ax, ay, ax + 1, ay + 1, (luma < thr) ? black : white);
-        }
-    }
-}
-
-static void rubyTogglePostProcessRect(LVDrawBuf * buf, int x0, int y0, int x1, int y1)
-{
-    switch (g_ruby_toggle_obscure) {
-    case RUBY_TOGGLE_OBSCURE_BLUR:
-        rubyToggleBoxBlurRect(buf, x0, y0, x1, y1);
-        if (g_ruby_toggle_blur_dither != RUBY_TOGGLE_BLUR_DITHER_NONE)
-            rubyToggleToneDitherRect(buf, x0, y0, x1, y1);
-        break;
-    case RUBY_TOGGLE_OBSCURE_DISSOLVE:
-    case RUBY_TOGGLE_OBSCURE_BAYER2:
-    case RUBY_TOGGLE_OBSCURE_BAYER4:
-    case RUBY_TOGGLE_OBSCURE_BAYER8:
-    case RUBY_TOGGLE_OBSCURE_CHECKER:
-    case RUBY_TOGGLE_OBSCURE_HATCH:
-    case RUBY_TOGGLE_OBSCURE_NOISE:
-        rubyToggleDitherRect(buf, x0, y0, x1, y1);
-        break;
-    default:
-        break;
-    }
+    groups.clear();
 }
 
 static bool rubyToggleIsAnnotationSide(ldomNode * node)
@@ -7654,6 +7321,9 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
 
             int text_decoration_back_gap;
             lUInt16 lastWordSrcIndex;
+            // Union Bar/Fog stand-ins across contiguous mono-ruby siblings so
+            // one visual word gets one soft block instead of per-<rt> boxes.
+            RubyToggleStandInMap ruby_standin_groups;
             for (j=0; j<frmline->word_count; j++)
             {
                 word = &frmline->words[j];
@@ -7661,17 +7331,14 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                 // Furigana Tool: hide/obscure suppressed <rt> paint. Text words
                 // fall through so vertical draw-state still advances.
                 // - Hidden: skip ink
-                // - Bar / Fog: skip ink, paint solid gray or fine Bayer fog
-                // - Blur/dissolve/dither: paint glyphs then post-process the slot
+                // - Bar / Fog: skip ink; accumulate stand-in, flushed per group
                 const bool ruby_suppress = rubyToggleShouldSuppress((ldomNode *)srcline->object);
                 const bool ruby_bar = ruby_suppress
                         && g_ruby_toggle_obscure == RUBY_TOGGLE_OBSCURE_BAR;
                 const bool ruby_fog = ruby_suppress
                         && g_ruby_toggle_obscure == RUBY_TOGGLE_OBSCURE_FOG;
                 const bool ruby_standin = ruby_bar || ruby_fog;
-                const bool ruby_post = ruby_suppress
-                        && rubyToggleIsPostProcessStyle(g_ruby_toggle_obscure);
-                const bool ruby_hide_ink = ruby_suppress && !ruby_post;
+                const bool ruby_hide_ink = ruby_suppress;
                 if ( (srcline->flags & LTEXT_HAS_EXTRA) && getLTextExtraProperty(srcline, LTEXT_EXTRA_CSS_HIDDEN) && !buf->WantsHiddenContent() )
                     continue;
                 if (word->flags & LTEXT_WORD_IS_IMAGE)
@@ -7690,7 +7357,9 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                                     ? draw_extra_info->vert_column_clip_right : clip.right;
                             applyVerticalImageDraw(frmline, word, y, line_x, column_clip_right, vstate, x0, y0);
                             if (ruby_standin) {
-                                rubyToggleDrawStandIn(buf, x0, y0, x0 + (int)word->width, y0 + (int)word->o.height);
+                                rubyToggleAccumulateStandIn(ruby_standin_groups,
+                                        (ldomNode *)srcline->object,
+                                        x0, y0, x0 + (int)word->width, y0 + (int)word->o.height);
                             } else {
                                 if ( verticalTextDebugEnabled() ) {
                                 lString32 img_class = node->getAttributeValue(attr_class);
@@ -7714,18 +7383,16 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                                         vstate.vert_min_next_x);
                                 }
                                 buf->Draw( img, x0, y0, word->width, word->o.height );
-                                if (ruby_post)
-                                    rubyTogglePostProcessRect(buf, x0, y0, x0 + (int)word->width, y0 + (int)word->o.height);
                             }
                         } else {
                             int xx = x + frmline->x + word->x;
                             int yy = line_y + frmline->baseline - word->o.height + word->y;
                             if (ruby_standin)
-                                rubyToggleDrawStandIn(buf, xx, yy, xx + (int)word->width, yy + (int)word->o.height);
+                                rubyToggleAccumulateStandIn(ruby_standin_groups,
+                                        (ldomNode *)srcline->object,
+                                        xx, yy, xx + (int)word->width, yy + (int)word->o.height);
                             else {
                                 buf->Draw( img, xx, yy, word->width, word->o.height );
-                                if (ruby_post)
-                                    rubyTogglePostProcessRect(buf, xx, yy, xx + (int)word->width, yy + (int)word->o.height);
                             }
                         }
                         //buf->FillRect( xx, yy, xx+word->width, yy+word->height, 1 );
@@ -7784,26 +7451,18 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                             bh = bw;
                         // Vertical-rl: word->width advances down the column (screen Y).
                         if (is_vertical)
-                            rubyToggleDrawStandIn(buf, x0, y0, x0 + bh, y0 + bw);
+                            rubyToggleAccumulateStandIn(ruby_standin_groups,
+                                    (ldomNode *)srcline->object,
+                                    x0, y0, x0 + bh, y0 + bw);
                         else
-                            rubyToggleDrawStandIn(buf, x0, y0, x0 + bw, y0 + bh);
+                            rubyToggleAccumulateStandIn(ruby_standin_groups,
+                                    (ldomNode *)srcline->object,
+                                    x0, y0, x0 + bw, y0 + bh);
                     }
                     else if ( srcline->o.objflags & LTEXT_OBJECT_IS_EMBEDDED_BLOCK ) {
                         // With embedded blocks, we shouldn't drop the clip (as we do next
                         // for regular inline-block boxes)
                         DrawDocument( *buf, node, x0, y0, dx, dy, doc_x_ib, doc_y_ib, page_height, absmarks, bookmarks );
-                        if (ruby_post) {
-                            int bw = (int)word->width;
-                            int bh = (int)word->o.height;
-                            if (bw <= 0)
-                                bw = bh > 0 ? bh : 8;
-                            if (bh <= 0)
-                                bh = bw;
-                            if (is_vertical)
-                                rubyTogglePostProcessRect(buf, x0, y0, x0 + bh, y0 + bw);
-                            else
-                                rubyTogglePostProcessRect(buf, x0, y0, x0 + bw, y0 + bh);
-                        }
                     }
                     else {
                         // inline-block boxes with negative margins can overflow the
@@ -7821,18 +7480,6 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                         }
                         DrawDocument( *buf, node, x0, y0, dx, dy, doc_x_ib, doc_y_ib, page_height, absmarks, bookmarks );
                         buf->SetClipRect(&curclip); // restore original page clip
-                        if (ruby_post) {
-                            int bw = (int)word->width;
-                            int bh = (int)word->o.height;
-                            if (bw <= 0)
-                                bw = bh > 0 ? bh : 8;
-                            if (bh <= 0)
-                                bh = bw;
-                            if (is_vertical)
-                                rubyTogglePostProcessRect(buf, x0, y0, x0 + bh, y0 + bw);
-                            else
-                                rubyTogglePostProcessRect(buf, x0, y0, x0 + bw, y0 + bh);
-                        }
                     }
                 }
                 else if (word->flags & LTEXT_WORD_IS_PAD)
@@ -7963,10 +7610,10 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                     }
                     {
                         // Furigana Tool: after vertical draw-state is updated, either
-                        // paint a bar, draw+post-process, or skip ink for suppressed <rt>.
+                        // paint a bar/fog stand-in or skip ink for suppressed <rt>.
                         int box_w = 0;
                         int box_h = 0;
-                        if ((ruby_standin || ruby_post) && font) {
+                        if (ruby_standin && font) {
                             if (is_vertical) {
                                 box_w = font->getSize();
                                 box_h = (int)word->width > 0 ? (int)word->width : font->getSize();
@@ -7978,7 +7625,9 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
 
                         if (ruby_hide_ink) {
                             if (ruby_standin && !vert_skip_draw && font)
-                                rubyToggleDrawStandIn(buf, x0, y0, x0 + box_w, y0 + box_h);
+                                rubyToggleAccumulateStandIn(ruby_standin_groups,
+                                        (ldomNode *)srcline->object,
+                                        x0, y0, x0 + box_w, y0 + box_h);
                             if (word_is_latin_in_vertical) {
                                 applyVerticalLatinPostDraw((int)word->width, (int)word->width, vstate, clip, y);
                             }
@@ -8002,8 +7651,6 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                             if (word_is_latin_in_vertical) {
                                 applyVerticalLatinPostDraw(_adv, (int)word->width, vstate, clip, y);
                             }
-                            if (ruby_post && !vert_skip_draw && font)
-                                rubyTogglePostProcessRect(buf, x0, y0, x0 + box_w, y0 + box_h);
                         }
                     }
                     // Fork: extracted vertical-mode emphasis marks (kenten/bouten).
@@ -8028,6 +7675,7 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                 lastWordSrcIndex = word->src_text_index;
                 lastWordEnd = word->x + word->width;
             }
+            rubyToggleFlushStandIns(buf, ruby_standin_groups);
 
 #ifdef CR_USE_INVERT_FOR_SELECTION_MARKS
             // process marks
