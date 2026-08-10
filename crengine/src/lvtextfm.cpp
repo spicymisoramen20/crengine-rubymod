@@ -255,6 +255,24 @@ static void rubyToggleDrawStandIn(LVDrawBuf * buf, int x0, int y0, int x1, int y
 
 // Contiguous sibling <ruby> elements (mono-ruby word). Head is used as the
 // union key so Bar/Fog paint one block for the whole visual word.
+// Ignore whitespace-only text nodes between rubies (common in EPUB markup).
+static bool rubyToggleIsIgnorableGroupSibling(ldomNode * node)
+{
+    if (!node)
+        return true;
+    if (node->isText()) {
+        lString32 t = node->getText();
+        for (int i = 0; i < t.length(); i++) {
+            lChar32 c = t[i];
+            if (!(c == ' ' || c == '\t' || c == '\r' || c == '\n'
+                    || c == 0x00A0 || c == 0x3000))
+                return false;
+        }
+        return true;
+    }
+    return false;
+}
+
 static ldomNode * rubyToggleGroupHead(ldomNode * node)
 {
     ldomNode * ruby = rubyToggleFindAncestor(node, "ruby");
@@ -267,12 +285,24 @@ static ldomNode * rubyToggleGroupHead(ldomNode * node)
     int first = index;
     while (first > 0) {
         ldomNode * prev = parent->getChildNode(first - 1);
+        if (rubyToggleIsIgnorableGroupSibling(prev)) {
+            first--;
+            continue;
+        }
         if (!prev || !prev->isElement() || prev->getNodeName() != "ruby")
             break;
         first--;
     }
-    ldomNode * head = parent->getChildNode(first);
-    return head ? head : ruby;
+    // Skip leading ignorable nodes to land on the first ruby in the run.
+    while (first <= index) {
+        ldomNode * child = parent->getChildNode(first);
+        if (child && child->isElement() && child->getNodeName() == "ruby")
+            return child;
+        if (!rubyToggleIsIgnorableGroupSibling(child))
+            break;
+        first++;
+    }
+    return ruby;
 }
 
 struct RubyToggleStandInRect {
@@ -286,6 +316,11 @@ struct RubyToggleStandInRect {
 };
 
 typedef std::map<const ldomNode *, RubyToggleStandInRect> RubyToggleStandInMap;
+
+// Nested LFormattedText::Draw (via DrawDocument into each <ruby>) must share
+// one accumulator so contiguous mono-ruby kanji merge into a single Fog/Bar.
+static int g_ruby_standin_depth = 0;
+static RubyToggleStandInMap * g_ruby_standin_groups = NULL;
 
 static void rubyToggleAccumulateStandIn(RubyToggleStandInMap & groups,
         ldomNode * from_node, int x0, int y0, int x1, int y1)
@@ -6822,6 +6857,15 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
     int line_y = y;
     draw_extra_info_t * draw_extra_info = (draw_extra_info_t*)buf->GetDrawExtraInfo();
 
+    // Share Bar/Fog stand-in accumulation across nested Draws (each <ruby>
+    // is drawn via DrawDocument). Only the outermost Draw flushes.
+    RubyToggleStandInMap ruby_standin_local;
+    const bool ruby_standin_outermost = (g_ruby_standin_depth == 0);
+    if (ruby_standin_outermost)
+        g_ruby_standin_groups = &ruby_standin_local;
+    g_ruby_standin_depth++;
+    RubyToggleStandInMap & ruby_standin_groups = *g_ruby_standin_groups;
+
     // Build the lineRect used by ldomMarkedRange::intersects() for marks/bookmarks.
     // In vertical-rl, frmline->width is set to strut_height (column WIDTH on screen),
     // not the inline content extent, so we must use m_pbuffer->width (inner_width of
@@ -7323,7 +7367,7 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
             lUInt16 lastWordSrcIndex;
             // Union Bar/Fog stand-ins across contiguous mono-ruby siblings so
             // one visual word gets one soft block instead of per-<rt> boxes.
-            RubyToggleStandInMap ruby_standin_groups;
+            // (Accumulator is shared across nested Draws; see Draw entry.)
             for (j=0; j<frmline->word_count; j++)
             {
                 word = &frmline->words[j];
@@ -7675,7 +7719,10 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                 lastWordSrcIndex = word->src_text_index;
                 lastWordEnd = word->x + word->width;
             }
-            rubyToggleFlushStandIns(buf, ruby_standin_groups);
+            // Nested ruby Draws only accumulate; the outermost paints the union
+            // after finishing each of its own form lines (siblings included).
+            if (ruby_standin_outermost)
+                rubyToggleFlushStandIns(buf, ruby_standin_groups);
 
 #ifdef CR_USE_INVERT_FOR_SELECTION_MARKS
             // process marks
@@ -7787,6 +7834,10 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
         }
     }
     delete absmarks;
+
+    g_ruby_standin_depth--;
+    if (ruby_standin_outermost)
+        g_ruby_standin_groups = NULL;
 }
 
 
