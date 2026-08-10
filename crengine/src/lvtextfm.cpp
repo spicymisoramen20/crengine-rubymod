@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include <set>
 #include <vector>
 #include "../include/crsetup.h"
@@ -93,6 +94,9 @@ static int g_ruby_toggle_blur_passes = 2;
 static int g_ruby_toggle_dither_intensity = 70;
 // Blur hide style only: NONE leaves soft grays; others ordered-dither them to B/W.
 static int g_ruby_toggle_blur_dither = RUBY_TOGGLE_BLUR_DITHER_BAYER4;
+// Fog shape: soft edge band and corner radius in pixels.
+static int g_ruby_toggle_fog_falloff = 4;
+static int g_ruby_toggle_fog_roundness = 5;
 static std::set<const ldomNode *> g_ruby_toggle_revealed;
 
 static bool rubyToggleIsPostProcessStyle(int style)
@@ -167,6 +171,20 @@ void rubyToggleSetBlurDither(int mode)
     g_ruby_toggle_blur_dither = mode;
 }
 
+void rubyToggleSetFogParams(int falloff, int roundness)
+{
+    if (falloff < 0)
+        falloff = 0;
+    if (falloff > 64)
+        falloff = 64;
+    if (roundness < 0)
+        roundness = 0;
+    if (roundness > 64)
+        roundness = 64;
+    g_ruby_toggle_fog_falloff = falloff;
+    g_ruby_toggle_fog_roundness = roundness;
+}
+
 void rubyToggleClear()
 {
     g_ruby_toggle_revealed.clear();
@@ -191,8 +209,27 @@ static void rubyToggleDrawBar(LVDrawBuf * buf, int x0, int y0, int x1, int y1)
     buf->FillRect(x0, y0, x1, y1, 0x888888);
 }
 
-// Fine Bayer fog stand-in: no glyphs, just a light gray field as B/W dots.
-// Intensity = approximate % black (typical 15–35 for a soft clean veil).
+// Fine Bayer fog stand-in: no glyphs, light gray field as B/W dots.
+// Intensity ≈ % black in the core. Falloff softens density near the
+// boundary; roundness uses a rounded-rect silhouette (no hard box corners).
+static float rubyToggleSdRoundBox(float px, float py, float hx, float hy, float r)
+{
+    if (r < 0.f)
+        r = 0.f;
+    float maxr = (hx < hy ? hx : hy);
+    if (r > maxr)
+        r = maxr;
+    float qx = fabsf(px) - hx + r;
+    float qy = fabsf(py) - hy + r;
+    float mx = qx > 0.f ? qx : 0.f;
+    float my = qy > 0.f ? qy : 0.f;
+    float outside = sqrtf(mx * mx + my * my);
+    float inside = (qx > qy ? qx : qy);
+    if (inside > 0.f)
+        inside = 0.f;
+    return inside + outside - r;
+}
+
 static void rubyToggleDrawFog(LVDrawBuf * buf, int x0, int y0, int x1, int y1)
 {
     if (!buf || x1 <= x0 || y1 <= y0)
@@ -227,14 +264,39 @@ static void rubyToggleDrawFog(LVDrawBuf * buf, int x0, int y0, int x1, int y1)
     if (x1 <= x0 || y1 <= y0)
         return;
 
+    const float w = (float)(x1 - x0);
+    const float h = (float)(y1 - y0);
+    const float hx = w * 0.5f;
+    const float hy = h * 0.5f;
+    const float cx = (float)x0 + hx - 0.5f;
+    const float cy = (float)y0 + hy - 0.5f;
+    float roundness = (float)g_ruby_toggle_fog_roundness;
+    float falloff = (float)g_ruby_toggle_fog_falloff;
+    if (falloff < 0.f)
+        falloff = 0.f;
+
     const lUInt32 black = 0x00000000;
-    // First clear the slot to page white so leftover body ink under rt
-    // does not show through the light fog.
-    buf->FillRect(x0, y0, x1, y1, 0x00FFFFFF);
+    // Do not white-out a hard rect — that made the fog look boxy. Stamp
+    // dots only; page / surrounding ink shows through the soft edge.
     for (int ay = y0; ay < y1; ay++) {
         for (int ax = x0; ax < x1; ax++) {
+            float sd = rubyToggleSdRoundBox((float)ax - cx, (float)ay - cy, hx, hy, roundness);
+            // sd < 0 inside. Depth = -sd.
+            if (sd >= 0.f)
+                continue;
+            float depth = -sd;
+            float coverage = 1.f;
+            if (falloff > 0.f) {
+                if (depth >= falloff)
+                    coverage = 1.f;
+                else
+                    coverage = depth / falloff;
+            }
+            int local_i = (int)((float)intensity * coverage + 0.5f);
+            if (local_i <= 0)
+                continue;
             int t = (M[ay & 7][ax & 7] * 100) / 64;
-            if (intensity > t)
+            if (local_i > t)
                 buf->FillRect(ax, ay, ax + 1, ay + 1, black);
         }
     }
