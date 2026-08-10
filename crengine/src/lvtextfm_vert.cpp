@@ -2204,8 +2204,6 @@ void applyVerticalWordDraw(
     if ( word->flags & LTEXT_WORD_IS_TCY ) {
         // TCY (tate-chu-yoko): draw text horizontally within vertical column.
         // The span occupies 1 em of column depth; text is centred in the column.
-        // If the horizontal run is wider than 1em (e.g. fullwidth ！！), the
-        // Draw caller shrinks it into an em×em box via LFNT_HINT_TRANSFORM_STRETCH.
         int em = font->getSize();
         int clamped_x = vertClampForward((int)word->x, state.vert_min_next_x);
         x0_out = line_x - frmline->height + (frmline->height - em) / 2;
