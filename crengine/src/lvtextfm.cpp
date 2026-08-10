@@ -59,9 +59,7 @@ static bool verticalTextDebugEnabled()
 // -----------------------------------------------------------------------------
 enum RubyToggleObscureStyle {
     RUBY_TOGGLE_OBSCURE_HIDDEN = 0,
-    RUBY_TOGGLE_OBSCURE_MOSAIC = 1,
-    RUBY_TOGGLE_OBSCURE_BAR = 2,
-    RUBY_TOGGLE_OBSCURE_DOTS = 3,
+    RUBY_TOGGLE_OBSCURE_BAR = 1,
 };
 
 static bool g_ruby_toggle_mode = false;
@@ -92,7 +90,7 @@ void rubyToggleSetMode(bool enabled)
 
 void rubyToggleSetObscureStyle(int style)
 {
-    if (style < RUBY_TOGGLE_OBSCURE_HIDDEN || style > RUBY_TOGGLE_OBSCURE_DOTS)
+    if (style < RUBY_TOGGLE_OBSCURE_HIDDEN || style > RUBY_TOGGLE_OBSCURE_BAR)
         style = RUBY_TOGGLE_OBSCURE_HIDDEN;
     g_ruby_toggle_obscure = style;
 }
@@ -119,58 +117,8 @@ static void rubyToggleDrawObscure(LVDrawBuf * buf, int x0, int y0, int x1, int y
     if (!buf || x1 <= x0 || y1 <= y0)
         return;
 
-    const lUInt32 dark = 0x888888;
-    const lUInt32 light = 0xCCCCCC;
-
     if (g_ruby_toggle_obscure == RUBY_TOGGLE_OBSCURE_BAR) {
-        buf->FillRect(x0, y0, x1, y1, dark);
-        return;
-    }
-
-    if (g_ruby_toggle_obscure == RUBY_TOGGLE_OBSCURE_MOSAIC) {
-        int short_side = x1 - x0;
-        if (y1 - y0 < short_side)
-            short_side = y1 - y0;
-        int cell = short_side / 3;
-        if (cell < 2)
-            cell = 2;
-        if (cell > 8)
-            cell = 8;
-        for (int yy = y0; yy < y1; yy += cell) {
-            for (int xx = x0; xx < x1; xx += cell) {
-                bool on = (((xx - x0) / cell) + ((yy - y0) / cell)) & 1;
-                int xr = xx + cell;
-                int yb = yy + cell;
-                if (xr > x1)
-                    xr = x1;
-                if (yb > y1)
-                    yb = y1;
-                buf->FillRect(xx, yy, xr, yb, on ? dark : light);
-            }
-        }
-        return;
-    }
-
-    if (g_ruby_toggle_obscure == RUBY_TOGGLE_OBSCURE_DOTS) {
-        int w = x1 - x0;
-        int h = y1 - y0;
-        int r = (w < h ? w : h) / 5;
-        if (r < 1)
-            r = 1;
-        // Three dots along the longer axis of the ruby slot.
-        if (h >= w) {
-            int cx = (x0 + x1) / 2;
-            for (int i = 0; i < 3; i++) {
-                int cy = y0 + (h * (2 * i + 1)) / 6;
-                buf->FillRect(cx - r, cy - r, cx + r, cy + r, dark);
-            }
-        } else {
-            int cy = (y0 + y1) / 2;
-            for (int i = 0; i < 3; i++) {
-                int cx = x0 + (w * (2 * i + 1)) / 6;
-                buf->FillRect(cx - r, cy - r, cx + r, cy + r, dark);
-            }
-        }
+        buf->FillRect(x0, y0, x1, y1, 0x888888);
         return;
     }
 }
