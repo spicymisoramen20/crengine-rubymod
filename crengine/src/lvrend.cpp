@@ -3815,7 +3815,13 @@ void renderFinalBlock( ldomNode * enode, LFormattedText * txform, RenderRectAcce
             flags |= LTEXT_HAS_EXTRA;
         }
         if ( style->text_combine_upright != css_tcu_none ) { // tate-chu-yoko
-            flags |= LTEXT_IS_TCY;
+            // FORK (vertical-rl): do not enable tate-chu-yoko under vertical
+            // writing modes. Combined runs such as <span class="tcy">！！</span>
+            // would be laid out as a 1em column slot but drawn horizontally at
+            // full glyph width, spilling ink into neighbouring columns. Leave
+            // them on the normal upright vertical path so they stack.
+            if ( !css_wm_is_vertical(resolveEffectiveWritingMode(enode)) )
+                flags |= LTEXT_IS_TCY;
         }
         if ( style->text_emphasis_style != css_tes_none
                 && style->text_emphasis_style != css_tes_inherit ) { // kenten/bouten
