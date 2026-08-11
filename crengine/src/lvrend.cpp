@@ -3815,13 +3815,12 @@ void renderFinalBlock( ldomNode * enode, LFormattedText * txform, RenderRectAcce
             flags |= LTEXT_HAS_EXTRA;
         }
         if ( style->text_combine_upright != css_tcu_none ) { // tate-chu-yoko
-            // FORK (vertical-rl): do not enable tate-chu-yoko under vertical
-            // writing modes. Combined runs such as <span class="tcy">！！</span>
-            // would be laid out as a 1em column slot but drawn horizontally at
-            // full glyph width, spilling ink into neighbouring columns. Leave
-            // them on the normal upright vertical path so they stack.
-            if ( !css_wm_is_vertical(resolveEffectiveWritingMode(enode)) )
-                flags |= LTEXT_IS_TCY;
+            // FORK: enable TCY under vertical-rl too. Publisher `.tcy` spans that
+            // used writing-mode:horizontal-tb are remapped in setNodeStyle to
+            // text-combine-upright:all so they stay in the vertical flow as a
+            // 1em TCY word (see lvtextfm layout/draw). Previously we skipped
+            // TCY in vertical and those spans escaped as nested horizontals.
+            flags |= LTEXT_IS_TCY;
         }
         if ( style->text_emphasis_style != css_tes_none
                 && style->text_emphasis_style != css_tes_inherit ) { // kenten/bouten
@@ -12051,6 +12050,46 @@ void setNodeStyle( ldomNode * enode, css_style_ref_t parent_style, LVFontRef par
     UPDATE_STYLE_FIELD( border_collapse, css_border_c_inherit );
     // Vertical text: writing-mode and text-orientation are inherited per CSS spec
     UPDATE_STYLE_FIELD( writing_mode, css_wm_inherit );
+    // FORK: publishers often fake 縦中横 with
+    //   .tcy { writing-mode: horizontal-tb; display: inline-block; }
+    // without text-combine-upright. That makes CRE nest a horizontal final
+    // (misplaced ink). Remap those to real tate-chu-yoko: stay in the vertical
+    // flow (inherit writing-mode), set text-combine-upright:all, drop inline-block.
+    if ( pstyle->writing_mode == css_wm_horizontal_tb && enode && enode->isElement() ) {
+        bool parent_vert = false;
+        for ( ldomNode * p = enode->getParentNode(); p && p->isElement(); p = p->getParentNode() ) {
+            css_style_ref_t ps = p->getStyle();
+            if ( ps.isNull() )
+                continue;
+            if ( ps->writing_mode != css_wm_inherit ) {
+                parent_vert = css_wm_is_vertical(ps->writing_mode);
+                break;
+            }
+        }
+        if ( parent_vert ) {
+            bool is_tcy_class = false;
+            lString32 cls = enode->getAttributeValue(attr_class);
+            for ( int i = 0; i < cls.length(); ) {
+                while ( i < cls.length() && (cls[i] == ' ' || cls[i] == '\t') )
+                    i++;
+                int s = i;
+                while ( i < cls.length() && cls[i] != ' ' && cls[i] != '\t' )
+                    i++;
+                if ( i > s && cls.substr(s, i - s) == U"tcy" ) {
+                    is_tcy_class = true;
+                    break;
+                }
+            }
+            if ( is_tcy_class || pstyle->text_combine_upright != css_tcu_none ) {
+                pstyle->writing_mode = css_wm_inherit;
+                if ( pstyle->text_combine_upright == css_tcu_none )
+                    pstyle->text_combine_upright = css_tcu_all;
+                if ( pstyle->display == css_d_inline_block
+                        || pstyle->display == css_d_inline_table )
+                    pstyle->display = css_d_inline;
+            }
+        }
+    }
     // Note: text_orientation has initial value css_to_mixed (not css_to_inherit),
     // so this propagation is currently inert, and no rendering code consumes the
     // field yet — it is parsed-but-unused.  Left in place for when 'upright' is

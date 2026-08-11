@@ -2203,10 +2203,32 @@ void applyVerticalWordDraw(
 
     if ( word->flags & LTEXT_WORD_IS_TCY ) {
         // TCY (tate-chu-yoko): draw text horizontally within vertical column.
-        // The span occupies 1 em of column depth; text is centred in the column.
+        // The span occupies 1 em of column depth. Layout forces word->width to
+        // em, but the ink is often narrower (ASCII "!!") or wider (fullwidth
+        // "！！"); centre the natural run in the em-wide column band so it
+        // lines up with surrounding CJK instead of hugging the left edge.
         int em = font->getSize();
         int clamped_x = vertClampForward((int)word->x, state.vert_min_next_x);
         x0_out = line_x - frmline->height + (frmline->height - em) / 2;
+        int natural_w = 0;
+        if ( srcline->t.text && word->t.len > 0 && word->t.len <= 127 ) {
+            lUInt16 widths[128];
+            lUInt8 mflags[128];
+            lUInt32 hints = WORD_FLAGS_TO_FNT_FLAGS(word->flags);
+            font->measureText(
+                srcline->t.text + word->t.start,
+                word->t.len,
+                widths, mflags,
+                0x7FFF,
+                '?',
+                srcline->lang_cfg,
+                srcline->letter_spacing + word->added_letter_spacing,
+                false,
+                hints);
+            natural_w = widths[word->t.len - 1];
+            if ( natural_w > 0 )
+                x0_out += (em - natural_w) / 2;
+        }
         int y_slot_start = y + frmline->x + clamped_x;
         y0_out = y_slot_start + (em - font->getHeight()) / 2;
         // Advance the DRAW tracker the same way the LAYOUT post-pass does for a
