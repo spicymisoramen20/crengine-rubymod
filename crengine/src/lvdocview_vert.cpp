@@ -11,20 +11,35 @@
 // =============================================================================
 
 /// Returns the screen-X anchor for the right edge of a vertical-rl page.
-/// In vertical-rl mode, columns are anchored at page_right: the first column
-/// sits at the right margin and subsequent columns progress leftward.  Any
-/// unused column space on a partial page (e.g. a chapter's final page with
-/// only a few short columns) MUST accumulate on the LEFT — this is the
-/// vertical-rl analogue of horizontal text leaving blank space at the bottom
-/// of a short last page.  We do NOT centre the content: an earlier version
-/// shifted the anchor inward by half the unused width, which made a chapter's
-/// last few columns float in the middle of the page instead of starting at
-/// the right.  All three callers (drawPageTo, docToWindowPoint,
-/// windowToDocPoint) use this function so the anchor stays consistent between
-/// rendering and coordinate conversion.
+/// In vertical-rl mode, columns are anchored at clip.right = page_right.
+/// page.height = N × strut ≤ page_width, so the remainder would otherwise
+/// accumulate on the left and make the left visual gap wider than the right
+/// (very noticeable on narrow phone screens).  Distribute it equally by
+/// shifting the anchor inward by half the gap.  All three callers
+/// (drawPageTo, docToWindowPoint, windowToDocPoint) use this function so
+/// draw and hit-testing stay aligned.
+///
+/// First-column ruby overhangs into the physical right margin (JLReq before
+/// side).  Body-only centering treats that whole margin as empty, so the
+/// left gap still looks larger than the ink-to-edge gap on the right.  Add
+/// half an em (capped by the right margin) to the centering offset so the
+/// body+ruby block balances.
+///
+/// Trade-off vs right-flush short pages: a chapter's final few columns are
+/// centered in the usable width rather than pinned to the right margin.
 int LVDocView::vertPageRight( const lvRect & pageRect, int page_content_height ) const {
-    (void)page_content_height; // no centering: always anchor at the right edge
-    return pageRect.right - m_pageMargins.right;
+    int page_right = pageRect.right - m_pageMargins.right;
+    int page_width = pageRect.width() - m_pageMargins.left - m_pageMargins.right;
+    // Mono-ruby overhang is typically ~0.5em into the right margin.
+    int ruby_reserve = m_font_size / 2;
+    if ( ruby_reserve > m_pageMargins.right )
+        ruby_reserve = m_pageMargins.right;
+    if ( ruby_reserve < 0 )
+        ruby_reserve = 0;
+    int centering_offset = (page_width - page_content_height + ruby_reserve) / 2;
+    if ( centering_offset < 0 )
+        centering_offset = 0;
+    return page_right - centering_offset;
 }
 
 /// Returns true if the document is laid out vertically (vertical-rl/-lr).
