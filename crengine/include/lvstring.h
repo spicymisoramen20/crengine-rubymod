@@ -1317,6 +1317,11 @@ public:
 
     SerialBuf & operator << ( lInt32 n );
 
+#if defined(_WIN32)
+    // MinGW: lInt32 is long, so plain int does not match either 32-bit overload.
+    SerialBuf & operator << ( int n ) { return (*this) << (lInt32)n; }
+#endif
+
     SerialBuf & operator << ( const lString32 & s );
 
     SerialBuf & operator << ( const lString8 & s8 );
