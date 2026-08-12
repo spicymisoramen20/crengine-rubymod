@@ -46,6 +46,43 @@
 extern "C" {
 #include <windows.h>
 }
+#include <string>
+// lString32 is UTF-32; Win32 WCHAR APIs expect UTF-16.
+static std::wstring UnicodeToUtf16(const lString32 & str)
+{
+    std::wstring dst;
+    dst.reserve((size_t)str.length() + 1);
+    for (int i = 0; i < str.length(); i++) {
+        lUInt32 ch = (lUInt32)str[i];
+        if (!(ch & ~0xFFFF)) {
+            dst.push_back((wchar_t)ch);
+        } else if (!(ch & ~0x1FFFFF)) {
+            dst.push_back((wchar_t)(0xD800 | ((((ch >> 16) & 0x1F) - 1) << 6) | ((ch >> 10) & 0x3F)));
+            dst.push_back((wchar_t)(0xDC00 | (ch & 0x3FF)));
+        } else {
+            dst.push_back(L'?');
+        }
+    }
+    return dst;
+}
+static lString32 Utf16ToUnicode(const wchar_t * s)
+{
+    if (!s || !s[0])
+        return lString32::empty_str;
+    lString32 dst;
+    while (*s) {
+        lUInt32 ch = (lUInt16)*s++;
+        if (ch >= 0xD800 && ch <= 0xDBFF && *s) {
+            lUInt32 low = (lUInt16)*s;
+            if (low >= 0xDC00 && low <= 0xDFFF) {
+                ++s;
+                ch = 0x10000 + (((ch - 0xD800) << 10) | (low - 0xDC00));
+            }
+        }
+        dst.append(1, (lChar32)ch);
+    }
+    return dst;
+}
 #else
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -600,7 +637,7 @@ public:
 		);
 		if ( m_hMap==NULL ) {
 			DWORD err = GetLastError();
-            CRLog::error( "LVFileMappedStream::Map() -- Cannot map file to memory, err=%08x, hFile=%08x", err, (lUInt32)m_hFile );
+            CRLog::error( "LVFileMappedStream::Map() -- Cannot map file to memory, err=%08x, hFile=%p", err, (void*)m_hFile );
             return error();
 		}
 		m_map = (lUInt8*) MapViewOfFile(
@@ -756,7 +793,7 @@ public:
             crFatalError();
             break;
         }
-        m_hFile = CreateFileW( fname.c_str(), m, s, NULL, c, FILE_ATTRIBUTE_NORMAL, NULL);
+        m_hFile = CreateFileW( UnicodeToUtf16(fname).c_str(), m, s, NULL, c, FILE_ATTRIBUTE_NORMAL, NULL);
         if (m_hFile == INVALID_HANDLE_VALUE || !m_hFile) {
 			// unicode not implemented?
 			lUInt32 err = GetLastError();
@@ -1323,7 +1360,7 @@ public:
             crFatalError();
             break;
         }
-        m_hFile = CreateFileW( fname.c_str(), m, s, NULL, c, FILE_ATTRIBUTE_NORMAL, NULL);
+        m_hFile = CreateFileW( UnicodeToUtf16(fname).c_str(), m, s, NULL, c, FILE_ATTRIBUTE_NORMAL, NULL);
         if (m_hFile == INVALID_HANDLE_VALUE || !m_hFile) {
          // unicode not implemented?
             lUInt32 err = GetLastError();
@@ -1611,7 +1648,7 @@ public:
         WIN32_FIND_DATAW data = { 0 };
         WIN32_FIND_DATAA dataa = { 0 };
         //lString8 bs = DOMString(path).ToAnsiString();
-        HANDLE hFind = FindFirstFileW(fn.c_str(), &data);
+        HANDLE hFind = FindFirstFileW(UnicodeToUtf16(fn).c_str(), &data);
         bool unicode=true;
         if (hFind == INVALID_HANDLE_VALUE || !hFind) {
             lUInt32 err=GetLastError();
@@ -1641,19 +1678,19 @@ public:
 
                 if ( (dwAttrs & FILE_ATTRIBUTE_DIRECTORY) ) {
                     // directory
-                    if (!lStr_cmp(pfn, L"..") || !lStr_cmp(pfn, L".")) {
+                    if (!wcscmp(pfn, L"..") || !wcscmp(pfn, L".")) {
                         // .. or .
                     } else {
                         // normal directory
                         LVDirectoryContainerItemInfo * item = new LVDirectoryContainerItemInfo;
-                        item->m_name = pfn;
+                        item->m_name = Utf16ToUnicode(pfn);
                         item->m_is_container = true;
                         dir->Add(item);
                     }
                 } else {
                     // file
                     LVDirectoryContainerItemInfo * item = new LVDirectoryContainerItemInfo;
-                    item->m_name = pfn;
+                    item->m_name = Utf16ToUnicode(pfn);
                     item->m_size = data.nFileSizeLow;
                     item->m_flags = data.dwFileAttributes;
                     dir->Add(item);
@@ -4097,7 +4134,7 @@ bool LVCreateDirectory( lString32 path )
             return false;
         }
 #ifdef _WIN32
-        return CreateDirectoryW( path.c_str(), NULL )!=0;
+        return CreateDirectoryW( UnicodeToUtf16(path).c_str(), NULL )!=0;
 #else
         //LVRemovePathDelimiter( path );
         lString8 path8 = UnicodeToUtf8( path );
@@ -4140,7 +4177,7 @@ LVStreamRef LVMapFileStream( const lChar32 * pathname, lvopen_mode_t mode, lvsiz
 bool LVDeleteFile( lString32 filename )
 {
 #ifdef _WIN32
-    return DeleteFileW( filename.c_str() ) ? true : false;
+    return DeleteFileW( UnicodeToUtf16(filename).c_str() ) ? true : false;
 #else
     if ( unlink( UnicodeToUtf8( filename ).c_str() ) )
         return false;
@@ -4157,7 +4194,8 @@ bool LVRenameFile(lString32 oldname, lString32 newname) {
 bool LVRenameFile(lString8 oldname, lString8 newname) {
 #ifdef _WIN32
     CRLog::trace("Renaming %s to %s", oldname.c_str(), newname.c_str());
-    bool res = MoveFileW(Utf8ToUnicode(oldname).c_str(), Utf8ToUnicode(newname).c_str()) != 0;
+    bool res = MoveFileW(UnicodeToUtf16(Utf8ToUnicode(oldname)).c_str(),
+                         UnicodeToUtf16(Utf8ToUnicode(newname)).c_str()) != 0;
     if (!res) {
         CRLog::error("Renaming result: %s for renaming of %s to %s", res ? "success" : "failed", oldname.c_str(), newname.c_str());
         CRLog::error("Last Error: %d", GetLastError());
@@ -4176,7 +4214,7 @@ bool LVDeleteFile( lString8 filename ) {
 /// delete directory, return true if directory is found and successfully deleted
 bool LVDeleteDirectory( lString32 filename ) {
 #ifdef _WIN32
-    return RemoveDirectoryW( filename.c_str() ) ? true : false;
+    return RemoveDirectoryW( UnicodeToUtf16(filename).c_str() ) ? true : false;
 #else
     if ( rmdir( UnicodeToUtf8( filename ).c_str() ) )
         return false;

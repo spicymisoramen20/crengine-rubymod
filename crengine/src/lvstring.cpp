@@ -38,6 +38,7 @@
 extern "C" {
 #include <windows.h>
 }
+#include <vector>
 #endif
 
 #define LS_DEBUG_CHECK
@@ -3290,14 +3291,21 @@ lString8 UnicodeToLocal( const lString32 & str )
    lString8 dst;
    if (str.empty())
       return dst;
+   // lString32 is UTF-32; convert via UTF-8 then to ACP wide then ACP bytes.
+   lString8 utf8 = UnicodeToUtf8(str);
+   int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), utf8.length(), NULL, 0);
+   if (wlen <= 0)
+      return dst;
+   std::vector<wchar_t> wbuf((size_t)wlen + 1);
+   MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), utf8.length(), wbuf.data(), wlen);
    CHAR def_char = '?';
    BOOL usedDefChar = FALSE;
    int len = WideCharToMultiByte(
       CP_ACP,
       WC_COMPOSITECHECK | WC_DISCARDNS
        | WC_SEPCHARS | WC_DEFAULTCHAR,
-      str.c_str(),
-      str.length(),
+      wbuf.data(),
+      wlen,
       NULL,
       0,
       &def_char,
@@ -3310,8 +3318,8 @@ lString8 UnicodeToLocal( const lString32 & str )
          CP_ACP,
          WC_COMPOSITECHECK | WC_DISCARDNS
           | WC_SEPCHARS | WC_DEFAULTCHAR,
-         str.c_str(),
-         str.length(),
+         wbuf.data(),
+         wlen,
          dst.modify(),
          len,
          &def_char,
@@ -3326,7 +3334,7 @@ lString32 LocalToUnicode( const lString8 & str )
    lString32 dst;
    if (str.empty())
       return dst;
-   int len = MultiByteToWideChar(
+   int wlen = MultiByteToWideChar(
       CP_ACP,
       0,
       str.c_str(),
@@ -3334,19 +3342,18 @@ lString32 LocalToUnicode( const lString8 & str )
       NULL,
       0
       );
-   if (len)
-   {
-      dst.insert(0, len, ' ');
-      MultiByteToWideChar(
-         CP_ACP,
-         0,
-         str.c_str(),
-         str.length(),
-         dst.modify(),
-         len
-         );
-   }
-   return dst;
+   if (wlen <= 0)
+      return dst;
+   std::vector<wchar_t> wbuf((size_t)wlen + 1);
+   MultiByteToWideChar(CP_ACP, 0, str.c_str(), str.length(), wbuf.data(), wlen);
+   // UTF-16 -> UTF-8 -> lString32
+   int u8len = WideCharToMultiByte(CP_UTF8, 0, wbuf.data(), wlen, NULL, 0, NULL, NULL);
+   if (u8len <= 0)
+      return dst;
+   lString8 utf8;
+   utf8.insert(0, u8len, ' ');
+   WideCharToMultiByte(CP_UTF8, 0, wbuf.data(), wlen, utf8.modify(), u8len, NULL, NULL);
+   return Utf8ToUnicode(utf8);
 }
 
 #else
