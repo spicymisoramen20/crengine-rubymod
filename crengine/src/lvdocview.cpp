@@ -2821,18 +2821,23 @@ bool LVDocView::docToWindowPoint(lvPoint & pt, bool isRectBottom, bool fitToPage
                         // vertPageRight() mirrors drawPageTo's clip.right (margin + centering).
                         int page_right = vertPageRight( m_pageRects[index],
                                                         m_pages[page + index]->height );
-                        int page_left   = m_pageRects[index].left   + m_pageMargins.left;
+                        // Match drawPageTo's column clip floor (pageRect.left), NOT
+                        // pageRect.left+margin.  Draw allows glyphs into the left
+                        // margin; rejecting here at the margin edge dropped or
+                        // truncated leftmost-column highlight bands (thin slivers)
+                        // while middle columns kept full strut width.
+                        int page_draw_left = m_pageRects[index].left;
                         int page_top    = m_pageRects[index].top    + m_pageMargins.top;
                         int page_bottom = m_pageRects[index].bottom - m_pageMargins.bottom;
                         int page_y_val  = m_pages[page + index]->start;
                         int doc_x = pt.x;
                         int doc_y = pt.y;
                         int screen_x = page_right - (doc_y - page_y_val);
-                        // Reject positions outside the visible page area. Ruby annotations
+                        // Reject positions outside the drawable page area. Ruby annotations
                         // in vertical-rl can produce large doc_x values (their internal
                         // frmline->x + word->x overflows the column height) making screen_y
                         // land off-screen. Check both axes with a 50px tolerance.
-                        if (screen_x < page_left - 50 || screen_x > page_right + 50) {
+                        if (screen_x < page_draw_left - 50 || screen_x > page_right + 50) {
                             return false;
                         }
                         int draw_x0 = m_pageRects[index].top + m_pageMargins.top + getPageHeaderHeight();

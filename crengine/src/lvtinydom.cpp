@@ -10638,6 +10638,48 @@ lvPoint ldomXPointer::toPoint(bool extended) const
 // So we return the char width (and no more the word width) of the char
 // pointed to by this XPointer (unlike ldomXRange::getRectEx() which deals
 // with a range between 2 XPointers).
+// Vertical-rl: highlight/selection boxes must cover the BASE glyph band only.
+// Ruby can inflate frmline->height past strut_height; annotation sits on the
+// right (before) side. Draw places base glyphs in an em-wide band that is
+// left-aligned when inflated, or centered when not — see applyVerticalWordDraw
+// and vertMarkRect. Returning the full inflated height made Lighten sit on the
+// annotation side of ruby columns.
+static void setGetRectLineYBand(lvRect & r, int rc_top, const formatted_line_t * fl,
+        bool is_vertical, int strut_height, int em)
+{
+    r.top = rc_top + fl->y;
+    if (!is_vertical) {
+        r.bottom = r.top + fl->height;
+        return;
+    }
+    const int H = (int)fl->height;
+    if (H <= 0) {
+        r.bottom = r.top;
+        return;
+    }
+    int band = em > 0 ? em : (strut_height > 0 ? strut_height : H);
+    if (band > H)
+        band = H;
+    int pad_left = 0;
+    // Match Draw: centre only when the column is not ruby-inflated.
+    if (strut_height > 0 && H <= strut_height && band < H)
+        pad_left = (H - band) / 2;
+    r.top = rc_top + fl->y + (H - pad_left - band);
+    r.bottom = rc_top + fl->y + (H - pad_left);
+}
+
+static int getRectWordEm(LFormattedText * txtform, const formatted_word_t * word)
+{
+    if (!txtform || !word)
+        return 0;
+    if (word->flags & (LTEXT_WORD_IS_IMAGE|LTEXT_WORD_IS_INLINE_BOX|LTEXT_WORD_IS_PAD))
+        return 0;
+    const src_text_fragment_t * src = txtform->GetSrcInfo(word->src_text_index);
+    if (!src || (src->flags & LTEXT_SRC_IS_OBJECT) || !src->t.font)
+        return 0;
+    return ((LVFont *)src->t.font)->getSize();
+}
+
 bool ldomXPointer::getRect(lvRect & rect, bool extended, bool adjusted, int * ctxFlags) const
 {
     //CRLog::trace("ldomXPointer::getRect()");
@@ -10754,6 +10796,9 @@ bool ldomXPointer::getRect(lvRect & rect, bool extended, bool adjusted, int * ct
         // Get the formatted text, so we can look where in it is this XPointer
         LFormattedTextRef txtform;
         finalNode->renderFinalBlock( txtform, &fmt, inner_width );
+        formatted_text_fragment_t * tbuf = txtform->GetBuffer();
+        const bool is_vert_rect = css_wm_is_vertical(tbuf->writing_mode);
+        const int strut_h_rect = tbuf->strut_height;
 
         int offset = getOffset();
 ////        ldomXPointerEx xp(node, offset);
@@ -10935,8 +10980,7 @@ bool ldomXPointer::getRect(lvRect & rect, bool extended, bool adjusted, int * ct
                                     word->t.start < nearestForwardSrcOffset ) ) ) {
                             // Found some word from a forward src that is nearest than previously found one:
                             // get its start as a possible best result.
-                            bestBidiRect.top = rc.top + frmline->y;
-                            bestBidiRect.bottom = bestBidiRect.top + frmline->height;
+                            setGetRectLineYBand(bestBidiRect, rc.top, frmline, is_vert_rect, strut_h_rect, 0);
                             bestBidiRectCtxFlags = ctxFlagsBase;
                             if ( word_is_rtl ) {
                                 bestBidiRect.right = word->x + word->width + rc.left + frmline->x;
@@ -10963,8 +11007,7 @@ bool ldomXPointer::getRect(lvRect & rect, bool extended, bool adjusted, int * ct
                             // Found word in that exact source text node
                             if ( word->flags & (LTEXT_WORD_IS_IMAGE|LTEXT_WORD_IS_INLINE_BOX) ) {
                                 // An image or inline-box is the single thing in its srcIndex
-                                rect.top = rc.top + frmline->y;
-                                rect.bottom = rect.top + frmline->height;
+                                setGetRectLineYBand(rect, rc.top, frmline, is_vert_rect, strut_h_rect, getRectWordEm(txtform.get(), word));
                                 rect.left = word->x + rc.left + frmline->x;
                                 if (word->width > 0)
                                     rect.right = rect.left + word->width; // width of image
@@ -10983,8 +11026,7 @@ bool ldomXPointer::getRect(lvRect & rect, bool extended, bool adjusted, int * ct
                             if ( word->t.start > offset ) { // later word in logical order
                                 if (nearestForwardSrcIndex != word->src_text_index ||
                                           word->t.start <= nearestForwardSrcOffset ) {
-                                    bestBidiRect.top = rc.top + frmline->y;
-                                    bestBidiRect.bottom = bestBidiRect.top + frmline->height;
+                                    setGetRectLineYBand(bestBidiRect, rc.top, frmline, is_vert_rect, strut_h_rect, 0);
                                     bestBidiRectCtxFlags = ctxFlagsBase;
                                     if ( word_is_rtl ) { // right edge of next logical word, as it is drawn on the left
                                         bestBidiRect.right = word->x + word->width + rc.left + frmline->x;
@@ -11006,8 +11048,7 @@ bool ldomXPointer::getRect(lvRect & rect, bool extended, bool adjusted, int * ct
                                 if (nearestForwardSrcIndex != word->src_text_index ||
                                         ( nearestForwardSrcOffset < word->t.start &&
                                           word->t.start+word->t.len > nearestForwardSrcOffset ) ) {
-                                    bestBidiRect.top = rc.top + frmline->y;
-                                    bestBidiRect.bottom = bestBidiRect.top + frmline->height;
+                                    setGetRectLineYBand(bestBidiRect, rc.top, frmline, is_vert_rect, strut_h_rect, 0);
                                     bestBidiRectCtxFlags = ctxFlagsBase;
                                     if ( word_is_rtl ) { // left edge of previous logical word, as it is drawn on the right
                                         bestBidiRect.left = word->x + rc.left + frmline->x;
@@ -11032,9 +11073,9 @@ bool ldomXPointer::getRect(lvRect & rect, bool extended, bool adjusted, int * ct
                                 lString32 str = src->t.text ? lString32(src->t.text, src->t.len) : lString32();
                                 if (offset == word->t.start && str.empty()) {
                                     rect.left = word->x + rc.left + frmline->x;
-                                    rect.top = rc.top + frmline->y;
+                                    setGetRectLineYBand(rect, rc.top, frmline, is_vert_rect, strut_h_rect, getRectWordEm(txtform.get(), word));
                                     rect.right = rect.left + 1;
-                                    rect.bottom = rect.top + frmline->height;
+
                                     if ( ctxFlags ) {
                                         *ctxFlags |= ctxFlagsBase;
                                         if ( word_is_rtl )
@@ -11054,8 +11095,7 @@ bool ldomXPointer::getRect(lvRect & rect, bool extended, bool adjusted, int * ct
                                     src->letter_spacing + word->added_letter_spacing,
                                     false,
                                     hints);
-                                rect.top = rc.top + frmline->y;
-                                rect.bottom = rect.top + frmline->height;
+                                setGetRectLineYBand(rect, rc.top, frmline, is_vert_rect, strut_h_rect, getRectWordEm(txtform.get(), word));
                                 // chx is the width of previous chars in the word
                                 int chx = (offset > word->t.start) ? w[ offset - word->t.start - 1 ] : 0;
                                 if ( word_is_rtl ) {
@@ -11137,8 +11177,7 @@ bool ldomXPointer::getRect(lvRect & rect, bool extended, bool adjusted, int * ct
                                 return true;
                             }
                             // Otherwise, return end of last word (?)
-                            rect.top = rc.top + frmline->y;
-                            rect.bottom = rect.top + frmline->height;
+                            setGetRectLineYBand(rect, rc.top, frmline, is_vert_rect, strut_h_rect, getRectWordEm(txtform.get(), word));
                             rect.left = word->x + rc.left + frmline->x + word->width;
                             rect.right = rect.left + 1;
                             if ( ctxFlags ) {
@@ -11168,7 +11207,7 @@ bool ldomXPointer::getRect(lvRect & rect, bool extended, bool adjusted, int * ct
                         // before this word
                         rect.left = word->x + rc.left + frmline->x;
                         //rect.top = word->y + rc.top + frmline->y + frmline->baseline;
-                        rect.top = rc.top + frmline->y;
+                        setGetRectLineYBand(rect, rc.top, frmline, is_vert_rect, strut_h_rect, getRectWordEm(txtform.get(), word));
                         if (extended) {
                             if (word->flags & (LTEXT_WORD_IS_IMAGE|LTEXT_WORD_IS_INLINE_BOX) && word->width > 0)
                                 rect.right = rect.left + word->width; // width of image
@@ -11178,7 +11217,7 @@ bool ldomXPointer::getRect(lvRect & rect, bool extended, bool adjusted, int * ct
                         else {
                             rect.right = rect.left + 1;
                         }
-                        rect.bottom = rect.top + frmline->height;
+
                         // No ctxFlags to set
                         return true;
                     } else if ( (word->src_text_index == srcIndex) &&
@@ -11201,9 +11240,9 @@ bool ldomXPointer::getRect(lvRect & rect, bool extended, bool adjusted, int * ct
                         // We can just do as in the first 'if'.
                         if (offset == word->t.start && str.empty()) {
                             rect.left = word->x + rc.left + frmline->x;
-                            rect.top = rc.top + frmline->y;
+                            setGetRectLineYBand(rect, rc.top, frmline, is_vert_rect, strut_h_rect, getRectWordEm(txtform.get(), word));
                             rect.right = rect.left + 1;
-                            rect.bottom = rect.top + frmline->height;
+
                             // No ctxFlags to set
                             return true;
                         }
@@ -11223,7 +11262,7 @@ bool ldomXPointer::getRect(lvRect & rect, bool extended, bool adjusted, int * ct
                         int chx = (offset > word->t.start) ? w[ offset - word->t.start - 1 ] : 0;
                         rect.left = word->x + chx + rc.left + frmline->x;
                         //rect.top = word->y + rc.top + frmline->y + frmline->baseline;
-                        rect.top = rc.top + frmline->y;
+                        setGetRectLineYBand(rect, rc.top, frmline, is_vert_rect, strut_h_rect, getRectWordEm(txtform.get(), word));
                         if (extended) { // get width of char at offset
                             // With one-char-long words, the measured width seems less correct than the one
                             // measured while making words (noticed with CJK words). Use it instead.
@@ -11265,19 +11304,19 @@ bool ldomXPointer::getRect(lvRect & rect, bool extended, bool adjusted, int * ct
                         }
                         else
                             rect.right = rect.left + 1;
-                        rect.bottom = rect.top + frmline->height;
+
                         // No ctxFlags to set
                         return true;
                     } else if (lastWord) {
                         // after last word
                         rect.left = word->x + rc.left + frmline->x + word->width;
                         //rect.top = word->y + rc.top + frmline->y + frmline->baseline;
-                        rect.top = rc.top + frmline->y;
+                        setGetRectLineYBand(rect, rc.top, frmline, is_vert_rect, strut_h_rect, getRectWordEm(txtform.get(), word));
                         if (extended)
                             rect.right = rect.left + 1; // not the right word: no char width
                         else
                             rect.right = rect.left + 1;
-                        rect.bottom = rect.top + frmline->height;
+
                         // No ctxFlags to set
                         return true;
                     }
