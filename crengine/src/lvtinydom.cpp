@@ -13793,6 +13793,36 @@ bool ldomXRange::getRectEx( lvRect & rect, bool & isSingleLine )
     return !rect.isEmpty();
 }
 
+// True if text sits under a ruby annotation container (<rt>/<rp>/<rtc>,
+// or a synthetic rubyBox marked T="rt"/"rtc"). Highlight segments must cover
+// base text only: walking mono-ruby DOM order (<rb>A</rb><rt>…</rt><rb>B</rb>)
+// would otherwise flush a new segment after every kanji and paint detached
+// annotation-column boxes beside the selection (vertical-rl phantom bars).
+static bool isRubyAnnotationTextNode(ldomNode * node)
+{
+    if (!node)
+        return false;
+    if (node->isText())
+        node = node->getParentNode();
+    while (node) {
+        if (node->isElement()) {
+            lUInt16 id = node->getNodeId();
+            if (id == el_rt || id == el_rp || id == el_rtc)
+                return true;
+            if (id == el_rubyBox && node->hasAttribute(attr_T)) {
+                lString32 t = node->getAttributeValue(attr_T);
+                if (t == U"rt" || t == U"rtc")
+                    return true;
+            }
+            // Stop at <ruby>: base-side children are not annotations.
+            if (id == el_ruby)
+                return false;
+        }
+        node = node->getParentNode();
+    }
+    return false;
+}
+
 // Returns the multiple segments (rectangle for each text line) that
 // this ldomXRange spans on the page.
 // The text content from S to E on this page will push 4 segments:
@@ -13871,6 +13901,15 @@ void ldomXRange::getSegmentRects( LVArray<lvRect> & rects, bool includeImages )
             // part of the range (unlike with text, where it's the char after)
             if ( !includeImages || !rangeEnd.getNode()->isImage() || curPos.compare(rangeEnd) > 0 )
                 break;
+        }
+
+        // Skip ruby annotations so consecutive base chars on the same line/column
+        // keep accumulating into one segment (do not flush lineStartRect here).
+        if (isRubyAnnotationTextNode(curPos.getNode())) {
+            go_on = includeImages ? curPos.nextTextOrImage() : curPos.nextText();
+            nodeStartRect = lvRect();
+            nodeStartRectCtx = RECT_CTX_NONE;
+            continue;
         }
 
         ldomNode *curFinalNode = curPos.getFinalNode();
