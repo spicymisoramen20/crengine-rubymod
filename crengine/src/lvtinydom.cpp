@@ -10642,9 +10642,9 @@ lvPoint ldomXPointer::toPoint(bool extended) const
 // inflates frmline->height past strut_height.
 //   Vertical-rl: annotation sits on the right (before); Draw left-aligns the
 //     em band when inflated (see applyVerticalWordDraw / vertMarkRect).
-//   Horizontal-tb: ruby-position:over puts annotation above; base sits at the
-//     bottom of the inflated line. Non-ruby lines keep full fl->height so
-//     Lighten still paints continuous line bars (including leading).
+//   Horizontal-tb: always a strut/em-tall band at the bottom of the line box
+//     so ruby and plain runs share the same Lighten thickness (annotation
+//     sits above when the line is ruby-inflated).
 static void setGetRectLineYBand(lvRect & r, int rc_top, const formatted_line_t * fl,
         bool is_vertical, int strut_height, int em)
 {
