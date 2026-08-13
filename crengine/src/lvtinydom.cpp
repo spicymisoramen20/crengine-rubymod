@@ -14419,8 +14419,22 @@ void ldomXRange::getSegmentRects( LVArray<lvRect> & rects, bool includeImages )
                     merged.add(cur);
                     continue;
                 }
+                // Union X only. lvRect::extend() would also union Y and inflate
+                // Lighten when mono-ruby fragments have slightly different
+                // tops/bottoms — making drag selections taller than word holds.
+                int left = prev.left < cur.left ? prev.left : cur.left;
+                int right = prev.right > cur.right ? prev.right : cur.right;
+                int h0 = prev.bottom - prev.top;
+                int h1 = cur.bottom - cur.top;
+                int h = h0 > h1 ? h0 : h1;
+                int bottom = prev.bottom > cur.bottom ? prev.bottom : cur.bottom;
+                prev.left = left;
+                prev.right = right;
+                prev.bottom = bottom;
+                prev.top = bottom - h;
+            } else {
+                prev.extend(cur);
             }
-            prev.extend(cur);
         }
         rects = merged;
     }
