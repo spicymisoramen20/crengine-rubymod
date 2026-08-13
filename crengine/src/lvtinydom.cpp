@@ -10638,23 +10638,36 @@ lvPoint ldomXPointer::toPoint(bool extended) const
 // So we return the char width (and no more the word width) of the char
 // pointed to by this XPointer (unlike ldomXRange::getRectEx() which deals
 // with a range between 2 XPointers).
-// Vertical-rl: highlight/selection boxes must cover the BASE glyph band only.
-// Ruby can inflate frmline->height past strut_height; annotation sits on the
-// right (before) side. Draw places base glyphs in an em-wide band that is
-// left-aligned when inflated, or centered when not — see applyVerticalWordDraw
-// and vertMarkRect. Returning the full inflated height made Lighten sit on the
-// annotation side of ruby columns.
+// Highlight/selection boxes must cover the BASE glyph band only when ruby
+// inflates frmline->height past strut_height.
+//   Vertical-rl: annotation sits on the right (before); Draw left-aligns the
+//     em band when inflated (see applyVerticalWordDraw / vertMarkRect).
+//   Horizontal-tb: ruby-position:over puts annotation above; base sits at the
+//     bottom of the inflated line. Non-ruby lines keep full fl->height so
+//     Lighten still paints continuous line bars (including leading).
 static void setGetRectLineYBand(lvRect & r, int rc_top, const formatted_line_t * fl,
         bool is_vertical, int strut_height, int em)
 {
     r.top = rc_top + fl->y;
-    if (!is_vertical) {
-        r.bottom = r.top + fl->height;
-        return;
-    }
     const int H = (int)fl->height;
     if (H <= 0) {
         r.bottom = r.top;
+        return;
+    }
+    if (!is_vertical) {
+        // No ruby inflation (or unknown strut): keep full line height.
+        if (strut_height <= 0 || H <= strut_height) {
+            r.bottom = r.top + H;
+            return;
+        }
+        int band = em > 0 ? em : strut_height;
+        if (band > H)
+            band = H;
+        if (band < 1)
+            band = H;
+        // Base band at bottom of ruby-inflated line (annotation above).
+        r.top = rc_top + fl->y + (H - band);
+        r.bottom = rc_top + fl->y + H;
         return;
     }
     int band = em > 0 ? em : (strut_height > 0 ? strut_height : H);
@@ -14359,6 +14372,60 @@ void ldomXRange::getSegmentRects( LVArray<lvRect> & rects, bool includeImages )
     // Add any lineStartRect not yet added
     if (! lineStartRect.isEmpty()) {
         rects.add( lineStartRect );
+    }
+
+    // Merge fragmented segments that share the same line (horizontal) or
+    // column band (vertical-rl). Mono-ruby still flushes on each erm_final
+    // (per <rb>), so without this Lighten paints per-kanji bars even though
+    // <rt> nodes are skipped above.
+    // Horizontal: also require near X-adjacency so same-row table cells stay
+    // separate.
+    if (rects.length() > 1) {
+        bool is_vertical = false;
+        ldomNode * startNode = getStart().getNode();
+        if (startNode) {
+            if (startNode->isText())
+                startNode = startNode->getParentNode();
+            ldomNode * finalNode = startNode;
+            while (finalNode && finalNode->getRendMethod() != erm_final)
+                finalNode = finalNode->getParentNode();
+            if (finalNode && !finalNode->getStyle().isNull())
+                is_vertical = css_wm_is_vertical(finalNode->getStyle()->writing_mode);
+        }
+        LVArray<lvRect> merged;
+        merged.reserve(rects.length());
+        merged.add(rects[0]);
+        for (int i = 1; i < rects.length(); i++) {
+            lvRect & prev = merged[merged.length() - 1];
+            const lvRect & cur = rects[i];
+            const int prev_mid = (prev.top + prev.bottom) / 2;
+            const int cur_mid = (cur.top + cur.bottom) / 2;
+            int band = prev.bottom - prev.top;
+            int cur_band = cur.bottom - cur.top;
+            if (cur_band > band)
+                band = cur_band;
+            if (band < 1)
+                band = 1;
+            if (abs(prev_mid - cur_mid) > band / 2) {
+                merged.add(cur);
+                continue;
+            }
+            if (!is_vertical) {
+                int gap;
+                if (cur.left >= prev.right)
+                    gap = cur.left - prev.right;
+                else if (prev.left >= cur.right)
+                    gap = prev.left - cur.right;
+                else
+                    gap = 0; // overlap
+                if (gap > band / 2) {
+                    merged.add(cur);
+                    continue;
+                }
+            }
+            prev.extend(cur);
+        }
+        rects = merged;
     }
 }
 
