@@ -10655,18 +10655,16 @@ static void setGetRectLineYBand(lvRect & r, int rc_top, const formatted_line_t *
         return;
     }
     if (!is_vertical) {
-        // Prefer a strut-tall content band at the bottom of the line so Lighten
-        // thickness matches for ruby-inflated and normal lines (em-only bands
-        // looked shorter / off-center next to full line-height bars).
-        if (strut_height > 0 && H > strut_height) {
-            int band = strut_height;
-            if (band > H)
-                band = H;
-            r.top = rc_top + fl->y + (H - band);
-            r.bottom = rc_top + fl->y + H;
-            return;
-        }
-        r.bottom = r.top + H;
+        // Always use a strut-tall (fallback: em) content band at the bottom of
+        // the line box so Lighten height matches for ruby and non-ruby runs.
+        // Full fl->height on plain lines looked larger than ruby base bands.
+        int band = strut_height > 0 ? strut_height : (em > 0 ? em : H);
+        if (band > H)
+            band = H;
+        if (band < 1)
+            band = H;
+        r.top = rc_top + fl->y + (H - band);
+        r.bottom = rc_top + fl->y + H;
         return;
     }
     int band = em > 0 ? em : (strut_height > 0 ? strut_height : H);
