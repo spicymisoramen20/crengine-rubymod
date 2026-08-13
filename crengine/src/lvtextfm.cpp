@@ -23,6 +23,7 @@
 #include "../include/lvfnt.h"
 #include "../include/lvtextfm.h"
 #include "../include/lvfntman_vert.h"   // fork-only: JFM class + glue/kern helpers
+#include "../include/lvkanjilevel.h"   // fork-only: JLPT / 常用 stand-in labels
 #include "../include/lvdrawbuf.h"
 #include "../include/fb2def.h"
 
@@ -74,6 +75,8 @@ static int g_ruby_toggle_dither_intensity = 10;
 // Fog shape: soft edge band and corner radius in pixels.
 static int g_ruby_toggle_fog_falloff = 5;
 static int g_ruby_toggle_fog_roundness = 15;
+// Stand-in level label: Off / JLPT / 常用 (see RubyToggleLevelScheme).
+static int g_ruby_toggle_level_scheme = RUBY_TOGGLE_LEVEL_OFF;
 static std::set<const ldomNode *> g_ruby_toggle_revealed;
 
 static ldomNode * rubyToggleFindAncestor(ldomNode * node, const char * name)
@@ -126,6 +129,13 @@ void rubyToggleSetFogParams(int falloff, int roundness)
         roundness = 64;
     g_ruby_toggle_fog_falloff = falloff;
     g_ruby_toggle_fog_roundness = roundness;
+}
+
+void rubyToggleSetLevelScheme(int scheme)
+{
+    if (scheme < RUBY_TOGGLE_LEVEL_OFF || scheme > RUBY_TOGGLE_LEVEL_KANKEN)
+        scheme = RUBY_TOGGLE_LEVEL_OFF;
+    g_ruby_toggle_level_scheme = scheme;
 }
 
 void rubyToggleClear()
@@ -260,8 +270,180 @@ static void rubyToggleDrawStandIn(LVDrawBuf * buf, int x0, int y0, int x1, int y
 {
     if (g_ruby_toggle_obscure == RUBY_TOGGLE_OBSCURE_FOG)
         rubyToggleDrawFog(buf, x0, y0, x1, y1);
-    else
+    else if (g_ruby_toggle_obscure == RUBY_TOGGLE_OBSCURE_BAR)
         rubyToggleDrawBar(buf, x0, y0, x1, y1);
+    // Hidden: no fill; level label (if any) is painted by flush.
+}
+
+// True when we need a union rect for Bar/Fog fill and/or a level label.
+static bool rubyToggleNeedsStandIn()
+{
+    return g_ruby_toggle_obscure == RUBY_TOGGLE_OBSCURE_BAR
+            || g_ruby_toggle_obscure == RUBY_TOGGLE_OBSCURE_FOG
+            || g_ruby_toggle_level_scheme != RUBY_TOGGLE_LEVEL_OFF;
+}
+
+// Collect base (non-annotation) text under a node into `out`.
+static void rubyToggleAppendBaseText(ldomNode * node, lString32 & out)
+{
+    if (!node)
+        return;
+    if (node->isText() || node->isEffectiveText()) {
+        out += node->getText();
+        return;
+    }
+    if (!node->isElement())
+        return;
+    lUInt16 id = node->getNodeId();
+    if (isRubyAnnotId(id))
+        return;
+    if (id == el_rubyBox && node->hasAttribute(attr_T)) {
+        lString32 t = node->getAttributeValue(attr_T);
+        if (t == U"rt" || t == U"rtc")
+            return;
+    }
+    if (node->getNodeName() == "rt" || node->getNodeName() == "rtc"
+            || node->getNodeName() == "rp")
+        return;
+    int n = node->getChildCount();
+    for (int i = 0; i < n; i++)
+        rubyToggleAppendBaseText(node->getChildNode(i), out);
+}
+
+static lString32 rubyToggleRubyBaseText(ldomNode * ruby)
+{
+    lString32 out;
+    rubyToggleAppendBaseText(ruby, out);
+    return out;
+}
+
+static bool rubyToggleIsIgnorableGroupSibling(ldomNode * node);
+
+// Contiguous mono-ruby siblings from group head, in document order.
+// Keeps one slot per ideograph (empty string if unmapped) so labels stay
+// aligned to their kanji even when some lack a JLPT/Joyo entry.
+static void rubyToggleAppendGroupLabels(ldomNode * head, LVArray<lString32> & labels)
+{
+    if (!head)
+        return;
+    ldomNode * parent = head->getParentNode();
+    if (!parent || !head->isElement() || head->getNodeName() != "ruby") {
+        lString32 base = rubyToggleRubyBaseText(head);
+        LVArray<lString32> part;
+        kanjiLevelLabelsForText(base, g_ruby_toggle_level_scheme, part);
+        labels.add(part);
+        return;
+    }
+    int index = head->getNodeIndex();
+    int n = parent->getChildCount();
+    for (int i = index; i < n; i++) {
+        ldomNode * child = parent->getChildNode(i);
+        if (rubyToggleIsIgnorableGroupSibling(child))
+            continue;
+        if (!child || !child->isElement() || child->getNodeName() != "ruby")
+            break;
+        lString32 base = rubyToggleRubyBaseText(child);
+        LVArray<lString32> part;
+        kanjiLevelLabelsForText(base, g_ruby_toggle_level_scheme, part);
+        labels.add(part);
+    }
+}
+
+static LVFontRef rubyToggleLevelFont(int font_size)
+{
+    LVFontRef font = fontMan->GetFont(font_size, 700, false, css_ff_sans_serif,
+            cs8("Noto Sans CJK SC"), 0, -1);
+    if (font.isNull())
+        font = fontMan->GetFont(font_size, 700, false, css_ff_sans_serif,
+                cs8("DejaVu Sans"), 0, -1);
+    return font;
+}
+
+// One label band per kanji along the fog (reading order). Empty slots are
+// kept so unmapped kanji leave a gap instead of shifting neighbors. y for
+// DrawTextString is the top of the line box (engine adds baseline itself).
+static void rubyToggleDrawLevelLabelsOnFog(LVDrawBuf * buf, int x0, int y0, int x1, int y1,
+        const LVArray<lString32> & labels)
+{
+    if (!buf || !fontMan || labels.length() <= 0 || x1 <= x0 || y1 <= y0)
+        return;
+    const int bw = x1 - x0;
+    const int bh = y1 - y0;
+    if (bw < 4 || bh < 4)
+        return;
+
+    const int n = labels.length();
+    int mapped = 0;
+    for (int i = 0; i < n; i++) {
+        if (!labels[i].empty())
+            mapped++;
+    }
+    if (mapped <= 0)
+        return;
+
+    // Vertical books: fog is tall → bands top→bottom. Horizontal: left→right.
+    const bool stack_y = (bh >= bw);
+    const int band = stack_y ? (bh / n) : (bw / n);
+    if (band < 4)
+        return;
+
+    int font_size = (band * 45) / 100;
+    if (font_size > 16)
+        font_size = 16;
+    if (font_size < 5)
+        font_size = 5;
+
+    LVFontRef font;
+    int max_tw = 0;
+    int th = 0;
+    for (int attempt = 0; attempt < 12; attempt++) {
+        font = rubyToggleLevelFont(font_size);
+        if (font.isNull())
+            return;
+        th = font->getHeight();
+        if (th <= 0)
+            return;
+        max_tw = 0;
+        for (int i = 0; i < n; i++) {
+            if (labels[i].empty())
+                continue;
+            int tw = font->getTextWidth(labels[i].c_str(), labels[i].length());
+            if (tw > max_tw)
+                max_tw = tw;
+        }
+        // Must fit inside one kanji band with a little padding.
+        if (th + 2 <= band && (max_tw <= (stack_y ? bw : band) + 2 || font_size <= 5))
+            break;
+        if (font_size <= 5)
+            break;
+        font_size--;
+    }
+    if (font.isNull() || th <= 0)
+        return;
+
+    buf->SetTextColor(0x000000);
+    for (int i = 0; i < n; i++) {
+        if (labels[i].empty())
+            continue;
+        int tw = font->getTextWidth(labels[i].c_str(), labels[i].length());
+        int x;
+        int y; // top of line box
+        if (stack_y) {
+            int by0 = y0 + (bh * i) / n;
+            int by1 = y0 + (bh * (i + 1)) / n;
+            int bh_i = by1 - by0;
+            x = x0 + (bw - tw) / 2;
+            y = by0 + (bh_i - th) / 2;
+        } else {
+            int bx0 = x0 + (bw * i) / n;
+            int bx1 = x0 + (bw * (i + 1)) / n;
+            int bw_i = bx1 - bx0;
+            x = bx0 + (bw_i - tw) / 2;
+            y = y0 + (bh - th) / 2;
+        }
+        font->DrawTextString(buf, x, y, labels[i].c_str(), labels[i].length(),
+                L'?', NULL, false);
+    }
 }
 
 // Contiguous sibling <ruby> elements (mono-ruby word). Head is used as the
@@ -329,7 +511,7 @@ struct RubyToggleStandInRect {
 typedef std::map<const ldomNode *, RubyToggleStandInRect> RubyToggleStandInMap;
 
 // Nested LFormattedText::Draw (via DrawDocument into each <ruby>) must share
-// one accumulator so contiguous mono-ruby kanji merge into a single Fog/Bar.
+// one accumulator: per-<ruby> rects for labels; Fog/Bar unions at flush.
 static int g_ruby_standin_depth = 0;
 static RubyToggleStandInMap * g_ruby_standin_groups = NULL;
 
@@ -338,12 +520,15 @@ static void rubyToggleAccumulateStandIn(RubyToggleStandInMap & groups,
 {
     if (x1 <= x0 || y1 <= y0)
         return;
-    ldomNode * head = rubyToggleGroupHead(from_node);
-    if (!head)
-        head = from_node;
-    if (!head)
+    // Key by the individual <ruby> so each mono-ruby kanji keeps its own
+    // stand-in rect for per-kanji level labels. Fog/Bar still unions by
+    // group head at flush time.
+    ldomNode * ruby = rubyToggleFindAncestor(from_node, "ruby");
+    if (!ruby)
+        ruby = from_node;
+    if (!ruby)
         return;
-    RubyToggleStandInRect & r = groups[head];
+    RubyToggleStandInRect & r = groups[ruby];
     if (!r.valid) {
         r.x0 = x0;
         r.y0 = y0;
@@ -364,10 +549,43 @@ static void rubyToggleAccumulateStandIn(RubyToggleStandInMap & groups,
 
 static void rubyToggleFlushStandIns(LVDrawBuf * buf, RubyToggleStandInMap & groups)
 {
+    // 1) Union Fog/Bar fills by contiguous mono-ruby group head.
+    RubyToggleStandInMap fog_unions;
     for (RubyToggleStandInMap::iterator it = groups.begin(); it != groups.end(); ++it) {
+        const RubyToggleStandInRect & r = it->second;
+        if (!r.valid)
+            continue;
+        ldomNode * head = rubyToggleGroupHead(const_cast<ldomNode *>(it->first));
+        if (!head)
+            head = const_cast<ldomNode *>(it->first);
+        RubyToggleStandInRect & u = fog_unions[head];
+        if (!u.valid) {
+            u = r;
+            continue;
+        }
+        if (r.x0 < u.x0) u.x0 = r.x0;
+        if (r.y0 < u.y0) u.y0 = r.y0;
+        if (r.x1 > u.x1) u.x1 = r.x1;
+        if (r.y1 > u.y1) u.y1 = r.y1;
+    }
+    for (RubyToggleStandInMap::iterator it = fog_unions.begin(); it != fog_unions.end(); ++it) {
         const RubyToggleStandInRect & r = it->second;
         if (r.valid)
             rubyToggleDrawStandIn(buf, r.x0, r.y0, r.x1, r.y1);
+    }
+
+    // 2) Per-kanji labels on each fog union: document order, centered + spaced.
+    if (g_ruby_toggle_level_scheme != RUBY_TOGGLE_LEVEL_OFF) {
+        for (RubyToggleStandInMap::iterator it = fog_unions.begin(); it != fog_unions.end(); ++it) {
+            const RubyToggleStandInRect & r = it->second;
+            if (!r.valid)
+                continue;
+            ldomNode * head = const_cast<ldomNode *>(it->first);
+            LVArray<lString32> labels;
+            rubyToggleAppendGroupLabels(head, labels);
+            if (labels.length() > 0)
+                rubyToggleDrawLevelLabelsOnFog(buf, r.x0, r.y0, r.x1, r.y1, labels);
+        }
     }
     groups.clear();
 }
@@ -7385,14 +7603,12 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
                 srcline = &m_pbuffer->srctext[word->src_text_index];
                 // Furigana Tool: hide/obscure suppressed <rt> paint. Text words
                 // fall through so vertical draw-state still advances.
-                // - Hidden: skip ink
-                // - Bar / Fog: skip ink; accumulate stand-in, flushed per group
+                // - Hidden: skip ink (optional level label via stand-in rect)
+                // - Bar / Fog: skip ink; accumulate stand-in fill (+ optional level)
+                // - Level scheme on: always accumulate union rect for label paint
                 const bool ruby_suppress = rubyToggleShouldSuppress((ldomNode *)srcline->object);
-                const bool ruby_bar = ruby_suppress
-                        && g_ruby_toggle_obscure == RUBY_TOGGLE_OBSCURE_BAR;
-                const bool ruby_fog = ruby_suppress
-                        && g_ruby_toggle_obscure == RUBY_TOGGLE_OBSCURE_FOG;
-                const bool ruby_standin = ruby_bar || ruby_fog;
+                // Bar/Fog fill, or Hidden with a level-label scheme, needs a union rect.
+                const bool ruby_standin = ruby_suppress && rubyToggleNeedsStandIn();
                 const bool ruby_hide_ink = ruby_suppress;
                 if ( (srcline->flags & LTEXT_HAS_EXTRA) && getLTextExtraProperty(srcline, LTEXT_EXTRA_CSS_HIDDEN) && !buf->WantsHiddenContent() )
                     continue;
