@@ -10655,19 +10655,18 @@ static void setGetRectLineYBand(lvRect & r, int rc_top, const formatted_line_t *
         return;
     }
     if (!is_vertical) {
-        // No ruby inflation (or unknown strut): keep full line height.
-        if (strut_height <= 0 || H <= strut_height) {
-            r.bottom = r.top + H;
+        // Prefer a strut-tall content band at the bottom of the line so Lighten
+        // thickness matches for ruby-inflated and normal lines (em-only bands
+        // looked shorter / off-center next to full line-height bars).
+        if (strut_height > 0 && H > strut_height) {
+            int band = strut_height;
+            if (band > H)
+                band = H;
+            r.top = rc_top + fl->y + (H - band);
+            r.bottom = rc_top + fl->y + H;
             return;
         }
-        int band = em > 0 ? em : strut_height;
-        if (band > H)
-            band = H;
-        if (band < 1)
-            band = H;
-        // Base band at bottom of ruby-inflated line (annotation above).
-        r.top = rc_top + fl->y + (H - band);
-        r.bottom = rc_top + fl->y + H;
+        r.bottom = r.top + H;
         return;
     }
     int band = em > 0 ? em : (strut_height > 0 ? strut_height : H);
@@ -16187,6 +16186,10 @@ public:
     /// called for each found text fragment in range
     virtual void onText( ldomXRange * nodeRange )
     {
+        // Base text only: skip <rt>/<rp> so selection / dictionary strings
+        // match getSegmentRects and getNextVisibleChar (no furigana injection).
+        if (isRubyAnnotationTextNode(nodeRange->getStart().getNode()))
+            return;
         if ( newBlock && !text.empty()) {
             text << delimiter;
         }
@@ -16203,6 +16206,17 @@ public:
     {
 #if BUILD_LITE!=1
         ldomNode * elem = (ldomNode *)ptr->getNode();
+        // Do not walk into ruby annotation subtrees.
+        if ( elem ) {
+            lUInt16 id = elem->getNodeId();
+            if ( id == el_rt || id == el_rp || id == el_rtc )
+                return false;
+            if ( id == el_rubyBox && elem->hasAttribute(attr_T) ) {
+                lString32 t = elem->getAttributeValue(attr_T);
+                if ( t == U"rt" || t == U"rtc" )
+                    return false;
+            }
+        }
         // Allow tweaking that with hints
         css_style_ref_t style = elem->getStyle();
         lvdom_element_render_method rm = elem->getRendMethod();
