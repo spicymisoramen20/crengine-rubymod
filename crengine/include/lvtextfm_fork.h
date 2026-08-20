@@ -209,6 +209,14 @@ extern int ltext_vert_image_draw_drift_max_px;
 // LFormattedText::Draw to route such words through the CJK +vert path.
 bool isWordAllVertRotationChars(const lChar32 * text, int len);
 
+// Vertical column-top prefs (Typeset → Vertical layout).
+// mode 0 = uniform tops (no first-column indent offset);
+// mode 1 = print-faithful (first column of a paragraph uses text-indent).
+// scale_percent is 0–100 and only applies in print-faithful mode.
+void ltext_set_vert_column_top_prefs(int mode, int scale_percent);
+void ltext_get_vert_column_top_prefs(int *mode_out, int *scale_out);
+int applyVerticalTextIndentPrefs(int indent, int writing_mode);
+
 // True if node is a vertical-ruby inline box: the boxing algorithm wraps
 // the ruby table in an el_inlineBox whose parent has display:ruby.
 static inline bool isRubyInlineBox(ldomNode * node) {

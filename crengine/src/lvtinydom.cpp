@@ -419,6 +419,8 @@ static lUInt32 calcHash(const lUInt8 * s, int len)
 {
     return XXH32(s, len, 0);
 }
+// Fork: vertical column-top prefs (defined in lvtextfm_vert.cpp).
+extern void ltext_get_vert_column_top_prefs(int *mode_out, int *scale_out);
 lUInt32 calcGlobalSettingsHash(int documentId, bool already_rendered)
 {
     lUInt32 hash = FORMATTING_VERSION_ID;
@@ -453,6 +455,15 @@ lUInt32 calcGlobalSettingsHash(int documentId, bool already_rendered)
         hash = hash * 31 + HyphMan::getRightHyphenMin();
         hash = hash * 31 + HyphMan::getTrustSoftHyphens();
         hash = hash * 31 + UserHyphDict::getHash();
+    }
+    // Fork: vertical column-top mode/scale are applied in Format(); include
+    // them so checkRenderContext() notices menu changes and re-layouts.
+    {
+        int mode = 1;
+        int scale = 100;
+        ltext_get_vert_column_top_prefs(&mode, &scale);
+        hash = hash * 31 + (lUInt32)mode;
+        hash = hash * 31 + (lUInt32)scale;
     }
     /*
     printf("  %d %d %d %d %d %d %d %d %d %d %d\n",

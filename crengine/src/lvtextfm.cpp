@@ -6799,6 +6799,7 @@ lUInt32 LFormattedText::Format(lUInt16 width, lUInt16 page_height, int para_dire
     // renderFinalBlock() why we do it that way - while it might be better
     // if it were provided as a parameter to LFormattedText::Format()).
     int indent = m_pbuffer->srctextlen > 0 ? m_pbuffer->srctext[0].indent : 0;
+    indent = applyVerticalTextIndentPrefs(indent, writing_mode);
     formatter.m_indent_first_line_done = false;
     if ( indent >= 0 ) { // positive indent affects only first line
         formatter.m_indent_current = indent;

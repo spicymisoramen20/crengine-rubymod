@@ -134,6 +134,39 @@ void ltext_get_vert_bleed(int *count_out, int *max_px_out) {
     *max_px_out = ltext_vert_bleed_max_px;
 }
 
+// Default matches current engine behavior: first-column indent at 100%.
+static int s_vert_column_top_mode = 1;
+static int s_vert_text_indent_scale_percent = 100;
+
+void ltext_set_vert_column_top_prefs(int mode, int scale_percent) {
+    s_vert_column_top_mode = (mode == 0) ? 0 : 1;
+    if ( scale_percent < 0 )
+        scale_percent = 0;
+    if ( scale_percent > 100 )
+        scale_percent = 100;
+    s_vert_text_indent_scale_percent = scale_percent;
+}
+
+void ltext_get_vert_column_top_prefs(int *mode_out, int *scale_out) {
+    if ( mode_out )
+        *mode_out = s_vert_column_top_mode;
+    if ( scale_out )
+        *scale_out = s_vert_text_indent_scale_percent;
+}
+
+int applyVerticalTextIndentPrefs(int indent, int writing_mode) {
+    if ( !css_wm_is_vertical(writing_mode) )
+        return indent;
+    if ( s_vert_column_top_mode == 0 )
+        return 0;
+    int scale = s_vert_text_indent_scale_percent;
+    if ( scale <= 0 )
+        return 0;
+    if ( scale >= 100 )
+        return indent;
+    return indent * scale / 100;
+}
+
 struct VertJustifyGap {
     int word_index;
     int stretch_px;
@@ -993,7 +1026,8 @@ void processParagraphVertical( LVFormatter* fmt, int start, int end, bool isLast
             // In vertical-rl, this is the offset from the top of the column.
             int y;
             if (para->flags & LTEXT_LEGACY_RENDERING) {
-                y = para->indent > 0 ? (pos == 0 ? para->indent : 0 ) : (pos==0 ? 0 : -para->indent);
+                int indent = applyVerticalTextIndentPrefs(para->indent, fmt->m_pbuffer->writing_mode);
+                y = indent > 0 ? (pos == 0 ? indent : 0 ) : (pos==0 ? 0 : -indent);
             } else {
                 y = fmt->m_indent_current;
                 if ( !fmt->m_indent_first_line_done ) {
